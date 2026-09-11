@@ -1,0 +1,711 @@
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import '../advertising/native_video_player_ad_configuration.dart';
+import '../advertising/native_video_player_ad_event.dart';
+import '../advertising/native_video_player_ad_platform.dart';
+import '../models/native_video_player_audio_track.dart';
+import '../models/native_video_player_quality.dart';
+import '../models/native_video_player_subtitle_track.dart';
+
+/// Handles all method channel communication with the native platform
+///
+/// Also implements the optional in-stream advertising transport contract
+/// ([NativeVideoPlayerAdvertisementPlatform]): ad commands ride the same
+/// shared method channel as every other player command and ad events are
+/// decoded from the existing controller-level event envelope. Native sides
+/// without an ad adapter simply return not-implemented, which the ad methods
+/// swallow — advertising must never break content playback.
+class VideoPlayerMethodChannel
+    implements NativeVideoPlayerAdvertisementPlatform {
+  VideoPlayerMethodChannel({required this.primaryPlatformViewId})
+    : _methodChannel = const MethodChannel('native_video_player');
+
+  final int primaryPlatformViewId;
+  final MethodChannel _methodChannel;
+
+  /// Creates a texture-rendered backend (Android `androidTextureMode`).
+  ///
+  /// [creationParams] must include the Dart-allocated `viewId` (from
+  /// `platformViewsRegistry.getNextPlatformViewId()`, so it can never
+  /// collide with a real platform view). Returns the engine `textureId`
+  /// to render with a `Texture` widget. Throws on failure — the widget
+  /// falls back gracefully.
+  static Future<int> createTextureView(
+    Map<String, dynamic> creationParams,
+  ) async {
+    final result = await const MethodChannel(
+      'native_video_player',
+    ).invokeMapMethod<String, Object?>('createTextureView', creationParams);
+    return result!['textureId']! as int;
+  }
+
+  /// Disposes all native texture backends (hot-restart hygiene: the Dart
+  /// isolate forgets them but they survive natively). Called once per
+  /// isolate before the first [createTextureView]. Failures are swallowed.
+  static Future<void> disposeAllTextureViews() async {
+    try {
+      await const MethodChannel(
+        'native_video_player',
+      ).invokeMethod<void>('disposeAllTextureViews');
+    } catch (e) {
+      debugPrint('disposeAllTextureViews failed: $e');
+    }
+  }
+
+  /// Tells the native side a platform view has been disposed.
+  ///
+  /// On iOS this releases the per-view EventChannel stream handler, whose
+  /// engine-side registration strongly retains the native view — without
+  /// this call the view (and its observers) can never deallocate. Android
+  /// cleans up in `PlatformView.dispose` and treats this as a no-op.
+  /// Static because it can target any view, not just the primary one.
+  static Future<void> notifyViewDisposed(int platformViewId) async {
+    try {
+      await const MethodChannel(
+        'native_video_player',
+      ).invokeMethod<void>('viewDisposed', {'viewId': platformViewId});
+    } catch (e) {
+      debugPrint('Error notifying view disposal for view $platformViewId: $e');
+    }
+  }
+
+  /// Loads a video URL
+  Future<void> load({
+    required String url,
+    required bool autoPlay,
+    Map<String, String>? headers,
+    Map<String, dynamic>? mediaInfo,
+    Map<String, dynamic>? drmConfig,
+    Map<String, dynamic>? adConfiguration,
+    List<Map<String, dynamic>>? sidecarSubtitles,
+    int? startAtMs,
+  }) async {
+    final Map<String, Object> params = <String, Object>{
+      'url': url,
+      'autoPlay': autoPlay,
+      'viewId': primaryPlatformViewId,
+    };
+
+    if (headers != null) {
+      params['headers'] = headers;
+    }
+
+    if (mediaInfo != null) {
+      params['mediaInfo'] = mediaInfo;
+    }
+
+    if (drmConfig != null) {
+      params['drmConfig'] = drmConfig;
+    }
+
+    // Native implementations deliberately ignore this optional field in
+    // Keep the optional configuration on the existing load contract so the
+    // no-ads path remains unchanged and no parallel channel is introduced.
+    if (adConfiguration != null) {
+      params['adConfiguration'] = adConfiguration;
+    }
+
+    if (sidecarSubtitles != null) {
+      params['sidecarSubtitles'] = sidecarSubtitles;
+    }
+
+    if (startAtMs != null && startAtMs > 0) {
+      params['startAtMs'] = startAtMs;
+    }
+
+    await _methodChannel.invokeMethod<void>('load', params);
+  }
+
+  /// Attaches sidecar subtitle sources natively (Android: rebuilds the
+  /// MediaItem with SubtitleConfigurations so captions can render in
+  /// PiP/native fullscreen). No-op failure by design.
+  Future<void> setSidecarSubtitles(
+    List<Map<String, dynamic>> sidecarSubtitles,
+  ) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setSidecarSubtitles', {
+        'viewId': primaryPlatformViewId,
+        'sidecarSubtitles': sidecarSubtitles,
+      });
+    } catch (e) {
+      debugPrint('Failed to set sidecar subtitles: $e');
+    }
+  }
+
+  /// Selects/deselects the natively sideloaded sidecar text track (Android;
+  /// used while PiP or native fullscreen hides the Flutter subtitle overlay).
+  Future<void> setNativeSidecarActive({
+    required bool active,
+    String? language,
+  }) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setNativeSidecarActive', {
+        'viewId': primaryPlatformViewId,
+        'active': active,
+        'language': ?language,
+      });
+    } catch (e) {
+      debugPrint('Failed to toggle native sidecar captions: $e');
+    }
+  }
+
+  /// Suppresses/restores native subtitle rendering around Android PiP, where the
+  /// system SubtitleView would otherwise render oversized captions in the small
+  /// PiP window. The native side snapshots the pre-PiP selection and restores it
+  /// when [suppressed] is false again.
+  Future<void> setSubtitlesSuppressedForPip(bool suppressed) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setSubtitlesSuppressedForPip', {
+        'viewId': primaryPlatformViewId,
+        'suppressed': suppressed,
+      });
+    } catch (e) {
+      debugPrint('Failed to toggle PiP subtitle suppression: $e');
+    }
+  }
+
+  /// Starts or resumes video playback
+  Future<void> play() async {
+    try {
+      await _methodChannel.invokeMethod<void>('play', <String, Object>{
+        'viewId': primaryPlatformViewId,
+      });
+    } catch (e) {
+      // Silently handle errors
+    }
+  }
+
+  /// Pauses video playback
+  Future<void> pause() async {
+    try {
+      await _methodChannel.invokeMethod<void>('pause', <String, Object>{
+        'viewId': primaryPlatformViewId,
+      });
+    } catch (e) {
+      debugPrint('Error calling pause: $e');
+    }
+  }
+
+  /// Seeks to a specific position
+  Future<void> seekTo(Duration position) async {
+    try {
+      await _methodChannel.invokeMethod<void>('seekTo', <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'milliseconds': position.inMilliseconds,
+      });
+    } catch (e) {
+      debugPrint('Error calling seekTo: $e');
+    }
+  }
+
+  /// Sets the volume
+  Future<void> setVolume(double volume) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setVolume', <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'volume': volume,
+      });
+    } catch (e) {
+      debugPrint('Error calling setVolume: $e');
+    }
+  }
+
+  /// Sets the text-size scale for embedded (native-rendered) subtitle
+  /// tracks. 1.0 = platform default. Issue #43.
+  Future<void> setEmbeddedTextScale(double scale) async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'setEmbeddedTextScale',
+        <String, Object>{'viewId': primaryPlatformViewId, 'scale': scale},
+      );
+    } catch (e) {
+      debugPrint('Error calling setEmbeddedTextScale: $e');
+    }
+  }
+
+  /// Sets the playback speed
+  Future<void> setSpeed(double speed) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setSpeed', <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'speed': speed,
+      });
+    } catch (e) {
+      debugPrint('Error calling setSpeed: $e');
+    }
+  }
+
+  /// Sets whether the video should loop
+  Future<void> setLooping(bool looping) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setLooping', <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'looping': looping,
+      });
+    } catch (e) {
+      debugPrint('Error calling setLooping: $e');
+    }
+  }
+
+  /// Sets the video quality
+  Future<void> setQuality(NativeVideoPlayerQuality quality) async {
+    try {
+      final Map<String, Object> params = <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'quality': quality.toMap(),
+      };
+      await _methodChannel.invokeMethod<void>('setQuality', params);
+    } catch (e) {
+      debugPrint('Error calling setQuality: $e');
+    }
+  }
+
+  /// Gets available video qualities
+  Future<List<NativeVideoPlayerQuality>> getAvailableQualities() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'getAvailableQualities',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      if (result is List) {
+        final qualities = result
+            .map(
+              (dynamic e) =>
+                  NativeVideoPlayerQuality.fromMap(e as Map<dynamic, dynamic>),
+            )
+            .toList();
+        return qualities;
+      }
+      debugPrint('No qualities found in result');
+      return <NativeVideoPlayerQuality>[];
+    } catch (e) {
+      debugPrint('Error fetching qualities: $e');
+      return <NativeVideoPlayerQuality>[];
+    }
+  }
+
+  /// Gets available subtitle tracks
+  Future<List<NativeVideoPlayerSubtitleTrack>>
+  getAvailableSubtitleTracks() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'getAvailableSubtitleTracks',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      if (result is List) {
+        final tracks = result
+            .map(
+              (dynamic e) => NativeVideoPlayerSubtitleTrack.fromMap(
+                e as Map<dynamic, dynamic>,
+              ),
+            )
+            .toList();
+        return tracks;
+      }
+      debugPrint('No subtitle tracks found in result');
+      return <NativeVideoPlayerSubtitleTrack>[];
+    } catch (e) {
+      debugPrint('Error fetching subtitle tracks: $e');
+      return <NativeVideoPlayerSubtitleTrack>[];
+    }
+  }
+
+  /// Sets the subtitle track
+  /// Pass a track with index -1 or use NativeVideoPlayerSubtitleTrack.off() to disable subtitles
+  Future<void> setSubtitleTrack(NativeVideoPlayerSubtitleTrack track) async {
+    try {
+      final Map<String, Object> params = <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'track': track.toMap(),
+      };
+      await _methodChannel.invokeMethod<void>('setSubtitleTrack', params);
+    } catch (e) {
+      debugPrint('Error calling setSubtitleTrack: $e');
+    }
+  }
+
+  /// Gets the alternate audio tracks of the current media
+  Future<List<NativeVideoPlayerAudioTrack>> getAvailableAudioTracks() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'getAvailableAudioTracks',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      if (result is List) {
+        return result
+            .map(
+              (dynamic e) => NativeVideoPlayerAudioTrack.fromMap(
+                e as Map<dynamic, dynamic>,
+              ),
+            )
+            .toList();
+      }
+      return <NativeVideoPlayerAudioTrack>[];
+    } catch (e) {
+      debugPrint('Error fetching audio tracks: $e');
+      return <NativeVideoPlayerAudioTrack>[];
+    }
+  }
+
+  /// Selects an alternate audio track
+  Future<void> setAudioTrack(NativeVideoPlayerAudioTrack track) async {
+    try {
+      await _methodChannel.invokeMethod<void>('setAudioTrack', <String, Object>{
+        'viewId': primaryPlatformViewId,
+        'track': track.toMap(),
+      });
+    } catch (e) {
+      debugPrint('Error calling setAudioTrack: $e');
+    }
+  }
+
+  /// Checks if Picture-in-Picture is available
+  Future<bool> isPictureInPictureAvailable() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'isPictureInPictureAvailable',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error checking PiP availability: $e');
+      return false;
+    }
+  }
+
+  /// Enters Picture-in-Picture mode
+  Future<bool> enterPictureInPicture() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'enterPictureInPicture',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error calling enterPictureInPicture: $e');
+      return false;
+    }
+  }
+
+  /// Exits Picture-in-Picture mode
+  Future<bool> exitPictureInPicture() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'exitPictureInPicture',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error calling exitPictureInPicture: $e');
+      return false;
+    }
+  }
+
+  /// Enables automatic inline Picture-in-Picture mode (iOS 14.2+)
+  Future<bool> enableAutomaticInlinePip() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'enableAutomaticInlinePip',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error calling enableAutomaticInlinePip: $e');
+      return false;
+    }
+  }
+
+  /// Disables automatic inline Picture-in-Picture mode (iOS 14.2+)
+  Future<bool> disableAutomaticInlinePip() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'disableAutomaticInlinePip',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error calling disableAutomaticInlinePip: $e');
+      return false;
+    }
+  }
+
+  /// Enters fullscreen mode
+  Future<void> enterFullScreen() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'enterFullScreen',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling enterFullScreen: $e');
+    }
+  }
+
+  /// Exits fullscreen mode
+  Future<void> exitFullScreen() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'exitFullScreen',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling exitFullScreen: $e');
+    }
+  }
+
+  /// Sets whether native player controls are shown
+  Future<void> setShowNativeControls(bool show) async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'setShowNativeControls',
+        <String, Object>{'viewId': primaryPlatformViewId, 'show': show},
+      );
+    } catch (e) {
+      debugPrint('Error calling setShowNativeControls: $e');
+    }
+  }
+
+  /// Checks if AirPlay is available (iOS only)
+  Future<bool> isAirPlayAvailable() async {
+    try {
+      final dynamic result = await _methodChannel.invokeMethod<dynamic>(
+        'isAirPlayAvailable',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+      return result == true;
+    } catch (e) {
+      debugPrint('Error calling isAirPlayAvailable: $e');
+      return false;
+    }
+  }
+
+  /// Shows the AirPlay route picker (iOS only)
+  Future<void> showAirPlayPicker() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'showAirPlayPicker',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling showAirPlayPicker: $e');
+    }
+  }
+
+  /// Disconnects from AirPlay (iOS only)
+  ///
+  /// Stops sending video to the currently connected AirPlay device.
+  /// AirPlay can be reconnected again later by the user.
+  ///
+  /// Throws if not currently connected to AirPlay.
+  Future<void> disconnectAirPlay() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'disconnectAirPlay',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling disconnectAirPlay: $e');
+      rethrow;
+    }
+  }
+
+  /// Starts AirPlay device detection (iOS only)
+  ///
+  /// Begins monitoring for available AirPlay devices. This should be called
+  /// when you want to start searching for AirPlay devices.
+  ///
+  /// Note: This is a global operation that affects the entire app.
+  Future<void> startAirPlayDetection() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'startAirPlayDetection',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling startAirPlayDetection: $e');
+      rethrow;
+    }
+  }
+
+  /// Stops AirPlay device detection (iOS only)
+  ///
+  /// Stops monitoring for available AirPlay devices. This should be called
+  /// when you no longer need to search for AirPlay devices.
+  ///
+  /// Note: This is a global operation that affects the entire app.
+  Future<void> stopAirPlayDetection() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'stopAirPlayDetection',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling stopAirPlayDetection: $e');
+      rethrow;
+    }
+  }
+
+  /// Asks the native side to ensure the player surface is connected to this view.
+  /// Called when reconnecting after all platform views were disposed (e.g. list→detail→back).
+  Future<void> ensureSurfaceConnected() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'ensureSurfaceConnected',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling ensureSurfaceConnected: $e');
+    }
+  }
+
+  /// Disposes the native player resources
+  Future<void> dispose() async {
+    try {
+      await _methodChannel.invokeMethod<void>('dispose', <String, Object>{
+        'viewId': primaryPlatformViewId,
+      });
+    } catch (e) {
+      debugPrint('Error calling dispose: $e');
+    }
+  }
+
+  /// Creates native advertising resources for one configured content load.
+  ///
+  /// No ad command is ever issued without an ad configuration, so a
+  /// content-only player never reaches this call. Failures are swallowed
+  /// (matching every other non-critical command here); native adapters
+  /// report genuine advertising failures through the controller-level
+  /// `advertisement` event envelope instead of the method-call result.
+  @override
+  Future<void> initializeAdvertisement(
+    NativeVideoPlayerAdConfiguration configuration,
+  ) async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementInitialize',
+        <String, Object>{
+          'viewId': primaryPlatformViewId,
+          'adConfiguration': configuration.toMap(),
+        },
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementInitialize: $e');
+    }
+  }
+
+  /// Asks the native adapter to request the configured VAST/VMAP schedule.
+  @override
+  Future<void> requestAdvertisements() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementRequestAds',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementRequestAds: $e');
+    }
+  }
+
+  @override
+  Future<void> completeContentForAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementContentComplete',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementContentComplete: $e');
+    }
+  }
+
+  /// Starts the currently prepared advertisement break.
+  @override
+  Future<void> startAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementStart',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementStart: $e');
+    }
+  }
+
+  /// Pauses the current advertisement break.
+  @override
+  Future<void> pauseAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementPause',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementPause: $e');
+    }
+  }
+
+  @override
+  Future<void> skipAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementSkip',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementSkip: $e');
+    }
+  }
+
+  /// Resumes the current advertisement break.
+  @override
+  Future<void> resumeAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementResume',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementResume: $e');
+    }
+  }
+
+  /// Stops the current advertisement break without destroying the adapter.
+  @override
+  Future<void> stopAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementStop',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementStop: $e');
+    }
+  }
+
+  /// Releases native advertising resources for this player.
+  @override
+  Future<void> destroyAdvertisement() async {
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'advertisementDestroy',
+        <String, Object>{'viewId': primaryPlatformViewId},
+      );
+    } catch (e) {
+      debugPrint('Error calling advertisementDestroy: $e');
+    }
+  }
+
+  /// Decodes an `advertisement` event received on the controller-level event
+  /// channel (`{'event': 'advertisement', 'adEvent': {...}}`) into the
+  /// package's provider-neutral ad event model. A bare ad-event map (no
+  /// envelope) decodes directly.
+  @override
+  NativeVideoPlayerAdEvent decodeEvent(Map<dynamic, dynamic> platformEvent) {
+    final Object? adEvent = platformEvent['adEvent'];
+    if (adEvent is Map) {
+      return NativeVideoPlayerAdEvent.fromMap(adEvent);
+    }
+    return NativeVideoPlayerAdEvent.fromMap(platformEvent);
+  }
+}

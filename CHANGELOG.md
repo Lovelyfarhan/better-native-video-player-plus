@@ -1,0 +1,1307 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+### Added
+- Optional Google IMA in-stream advertising on Android and iOS.
+- VAST pre-roll, manually scheduled mid-roll, and post-roll support.
+- VMAP scheduling through the native IMA SDK.
+- Ad pods, normalized ad events, quartile tracking, click-through metadata,
+  skip offsets, and skippable/non-skippable ad UI.
+- Recoverable and fatal ad error policies with lifecycle cleanup.
+
+### Documentation
+- Added advertising setup, API, event, lifecycle, VAST, VMAP, and platform
+  configuration examples to the README.
+
+## [1.5.2] - 2026-07-07
+
+### Fixed
+- **Android: video no longer pauses when expanding the PiP window back into
+  the app.** The close-button detection sampled the Flutter lifecycle once,
+  300 ms after the PiP flag flipped off — but on expand-back `resumed` often
+  arrives later than that (the exit animation has to finish first), so the
+  return was misclassified as a dismissal and playback was paused. The check
+  now waits up to 2 s for `resumed` and only pauses when it never arrives
+  (the genuine X-button dismiss case).
+
+## [1.5.1] - 2026-07-07
+
+### Changed
+- **Removed the `dismissible_page` dependency** (#50). The fullscreen player's
+  swipe-down-to-dismiss is now a small built-in implementation with the same
+  behavior (drag follows the finger with scale/corner-radius/background-fade,
+  15% release threshold). `dismissible_page` had been unmaintained since 2023;
+  dropping it also fixes dependency resolution on pub mirrors that are missing
+  that package. No API changes.
+- Package metadata (`homepage`/`repository`/`issue_tracker`) now points at the
+  canonical `plug-and-pay/flutter-native-video-player` repository.
+
+## [1.5.0] - 2026-07-07
+
+Playback resilience release: stalled-load watchdog, Android decoder fallback, iOS total-player cap, and PiP audio fixes.
+
+### Added
+- **Stalled-playback watchdog.** New `NativeVideoPlayerConfig.loadTimeout` (default 30 s) and `bufferingTimeout` (default off). The native load path only ever reports "ready" or an explicit player error — a stalled decoder emits neither, leaving apps on an infinite spinner. When a player now sits in `initializing`/`loading` (or, opted-in, `buffering`) past the timeout, the controller synthesizes the same `error` activity event a native failure produces (message: "Load timed out…"/"Buffering timed out…") and best-effort pauses the stuck pipeline, so app error/retry UI actually shows. `null` disables either watchdog.
+- **Android decoder fallback (default on).** The shared player is now built with `DefaultRenderersFactory.setEnableDecoderFallback(true)`: when the primary hardware decoder fails to initialize, ExoPlayer falls back to the next decoder instead of failing playback.
+- **`androidForceSoftwareDecoders` (opt-in, default off).** Restricts `MediaCodec` selection to software decoders (`OMX.google.*` / `c2.android.*`) via a custom `MediaCodecSelector`, falling back to the default list when no software decoder exists for a mime type. Escape hatch for devices whose vendor hardware decoders crash; expect higher CPU use and possibly dropped frames on high-res content.
+- **iOS total-player cap with LRU eviction.** New `NativeVideoPlayerConfig.iosMaxTotalPlayers` (default 6). `maxConcurrentPlayingPlayers` bounds *playing* players, but paused players keep their `AVPlayerItem` alive — and iOS's finite decode pipeline makes NEW items fail once enough accumulate. Creating a player beyond the cap now tears down the least-recently-used player that is not playing, not in PiP, not on AirPlay, and not texture-backed (soft cap: active playback is never killed). The evicted controller is notified (`playerEvicted`) and transparently re-loads its last source at the eviction position on its next `play()`.
+- **`getPictureInPictureStatus()`.** Ground-truth PiP query: `isPipEnabled` is event-driven on iOS but poll-derived on Android (150 ms, fullscreen-only), so it can be stale exactly when the app backgrounds into PiP. The new call queries the platform directly on Android and refreshes the flag.
+
+### Fixed
+- **Android PiP no longer goes silent.** Two races conspired to mute PiP (video kept playing without sound): (1) `BackgroundPlaybackGuard` read the stale polled `isPipEnabled` on the `paused`/`hidden` transition and could pause an active PiP session — it now confirms via `getPictureInPictureStatus()` and re-checks the playback state after the await; the Android PiP poll also fires its first check immediately instead of after the first 150 ms tick. (2) Audio focus was abandoned the instant `isPlaying` flipped false — a plain pause now defers the abandon by a 30 s grace period (cancelled on resume; stop/end/dispose still abandon immediately), so a transient pause during the PiP transition no longer surrenders the audio session.
+
+## [1.4.0] - 2026-07-02
+
+### Added
+
+- **Embedded caption text-size scaling** (#43): `NativeVideoPlayerSubtitleStyle.embeddedTextScale`
+  (default `1.0` = platform default) and the convenience method
+  `controller.setNativeSubtitleTextScale(double)` scale the text size of EMBEDDED
+  (native-rendered) subtitle tracks — ExoPlayer's `SubtitleView` on Android (both the
+  lightweight and PlayerView display paths), `AVPlayerItem.textStyleRules` on iOS.
+  Takes effect live without a playback restart, survives quality/audio/variant switches,
+  item reloads, and native view recreation, and scales relative to the user's system
+  caption size preference. Sidecar overlay sizing (`subtitleStyle.fontSize`) is unaffected.
+
+## [1.3.2] - 2026-07-02
+
+### Fixed
+
+- **Android**: dismissing the Dart fullscreen dialog (back button) now disarms the
+  activity-global auto-enter PiP (`cancelOnLeavePiP`). Previously the armed state leaked
+  permanently after one fullscreen visit, so any later app-leave entered PiP — even from
+  inline playback or with no video playing (Huddle HAB-837).
+- **Android**: closing the PiP window with its X button now pauses playback instead of
+  leaving the media session playing audio in the background. Expanding the PiP window back
+  into the app keeps playing as before (Huddle HAB-838).
+- **Android**: the media notification uses a proper monochrome small icon (host
+  `ic_notification` drawable, then the FCM default-notification-icon meta-data) instead of
+  the tinted launcher icon that rendered as a white square (#45).
+- **Cast**: LIVE streams start at the live edge instead of the beginning of the DVR
+  window — `currentTime` is omitted from the LOAD request unless explicitly set (#44).
+
+## [1.3.1] - 2026-06-24
+
+iOS Swift Package Manager build fix.
+
+### Fixed
+- **iOS: SwiftPM builds failed with `Cannot find 'npLog' in scope`.** The plugin keeps two parallel iOS source trees: CocoaPods compiles everything under `Classes/` (`s.source_files = 'Classes/**/*.swift'`), while the Swift Package Manager target (`ios/better_native_video_player`) symlinks each *subdirectory* of `Classes/` into its `Sources/` folder. `Logging.swift` — which defines `npLog` and is the only file at the top level of `Classes/` — had no symlink, so it was excluded from the SPM target and any call site (e.g. `VideoPlayerView.swift`) failed to compile under a SwiftPM build. CocoaPods builds were unaffected. Added the missing `Logging.swift` symlink to the SPM target. (#36, #42)
+
+## [1.3.0] - 2026-06-23
+
+Quality-selection and Android background-playback fixes.
+
+### Fixed
+- **Quality switching no longer drops audio (iOS + Android).** Selecting an HLS quality — or switching back to Auto — previously reloaded a single video-only variant playlist, replacing the master. On adaptive streams that carry audio as a separate rendition (`#EXT-X-MEDIA:TYPE=AUDIO`), that silenced the audio while video kept playing. The plugin now keeps the master loaded and constrains the **video track** via the player's track selector (`preferredMaximumResolution`/`preferredPeakBitRate` on iOS, `setMaxVideoSize`/`setMaxVideoBitrate` on Android), so audio is untouched and the switch is instant (no buffering reload).
+- **`qualityChangedStream` now emits the selected quality.** Native emits the quality fields flat in the event map, but the Dart handler only accepted a nested `quality` key, so the stream stayed silent and any UI bound to it was stuck on "Auto". The handler now accepts both shapes.
+- **iOS: position/time updates no longer stop when Auto quality is enabled.** The old auto-quality monitor reused the shared periodic time observer that drives `timeUpdate`, clobbering position reporting. The monitor is removed — AVPlayer's native ABR handles Auto.
+- **Android: background playback (live + VOD) no longer dies after a few minutes.** The plugin posted a media notification but never ran a real foreground service, so Doze/App-Standby cut the app's network and ExoPlayer failed with `UnknownHostException`. Playback now runs as a real foreground service while playing (stopped on pause/stop), and the shared player uses `setWakeMode(WAKE_MODE_NETWORK)` (partial WakeLock + WifiLock). Adds the `WAKE_LOCK` permission to the plugin manifest.
+
+## [1.2.1] - 2026-06-22
+
+Android Picture-in-Picture subtitle fix.
+
+### Fixed
+- **Subtitles no longer render oversized in Android Picture-in-Picture.** Android never reported PiP state (only iOS emitted PiP events), so the Flutter caption overlay stayed visible and drew its large fullscreen-landscape font into the small PiP window. The controller now tracks Android PiP via the `floating` package's status while fullscreen — entering PiP hides the caption overlay and suppresses native (embedded/sidecar) caption rendering; exiting restores the previous selection. As a side effect, `isPipEnabled` / `isPipEnabledStream` now reflect PiP state on Android. iOS unchanged.
+
+## [1.2.0] - 2026-06-18
+
+Orientation- and fullscreen-aware sidecar caption sizing.
+
+### Added
+- **Captions can grow when fullscreen in landscape.** `NativeVideoPlayerSubtitleStyle` gains three optional overrides — `fullscreenLandscapeFontSize`, `fullscreenLandscapeFontWeight`, and `fullscreenLandscapeLineHeight` — applied only while the player is fullscreen *and* in landscape orientation. Each falls back to the matching base value (`fontSize` / `fontWeight` / `lineHeight`) when null, so inline and fullscreen-portrait keep the base typography. The widget reads live `MediaQuery` orientation, so both the inline player and the Dart fullscreen route restyle on rotation.
+
+### Fixed
+- **A player constructed while another is fullscreen no longer forces the device back to portrait.** When several players are alive (e.g. multiple video tiles on one screen) and one is in Dart fullscreen, constructing or re-mounting another player ran its `preferredOrientations` through `FullscreenManager.setPreferredOrientations`, which immediately reset the device orientation — fighting the fullscreen player and snapping it out of landscape on rotation. `FullscreenManager` now tracks whether a player is fullscreen and, while one is, records a constructed player's preferred orientations as the restore baseline **without** applying them to the device. No effect on the single-player case.
+
+## [1.1.3] - 2026-06-18
+
+Android subtitle de-duplication and exact-track selection fixes.
+
+### Fixed
+- **A sidecar caption no longer appears twice on Android.** URL sidecar subtitles are attached natively (so captions render in PiP and native fullscreen), which made them echo back from the native track list *in addition to* the Dart sidecar entry — e.g. two identical "Nederlands" rows. `getAvailableSubtitleTracks()` now suppresses, by language, the native echo of any sidecar it attached natively, so each caption is listed once. iOS is unaffected (no native sideload), so a genuine embedded track such as "CC" still appears alongside the sidecar.
+- **Selecting a subtitle pins the exact track instead of every track in that language.** Android selection used `setPreferredTextLanguage`, which enabled *all* text tracks sharing the language — with a sidecar and an embedded track both in, say, Dutch, both were enabled at once, rendering two overlapping caption tracks and crashing playback. `setSubtitleTrack()` now applies a `TrackSelectionOverride` on the specific track group (the same approach as audio-track selection), and subtitle tracks are enumerated/selected by a stable flat index across track groups (a per-group index collided between the embedded and sidecar groups).
+
+## [1.1.2] - 2026-06-18
+
+Re-release of 1.1.1 with a clean package archive — 1.1.1 accidentally bundled
+the local `build/` directory (~13 MB). No code changes from 1.1.1.
+
+## [1.1.1] - 2026-06-18
+
+Sidecar (VTT/SRT) subtitle fixes for fullscreen and outline rendering.
+
+### Fixed
+- **Captions anchor to the video, not the screen, in fullscreen.** The Flutter sidecar-subtitle overlay now constrains its cue block to the video's content rect (`Center` + `AspectRatio`, matching the texture path's letterbox fit) instead of the full widget bounds. Previously, in portrait fullscreen with a 16:9 video, captions sat at the bottom of the *screen* — well below the letterboxed video.
+- **`videoSize` is now reported from platform-view players too** (iOS `AVPlayerItem.presentationSize` KVO; Android `Player.Listener.onVideoSizeChanged` on the SurfaceView/PlayerView paths), so `controller.videoSize` / `videoSizeStream` is populated in all rendering modes — including Dart fullscreen, which the overlay needs to letterbox-match captions.
+- **`subtitleStyle` is forwarded into the Dart fullscreen player.** `FullscreenVideoPlayer` (and the controller's `_enterDartFullscreen`) now pass the app's `subtitleStyle` to the fullscreen `NativeVideoPlayer`, so fullscreen captions match the inline player instead of falling back to the default style.
+- **Crisp caption outline.** The caption outline is now a true vector stroke (a stroked text pass under the filled pass) instead of four diagonal corner shadows, which left the cardinal edges uncovered and doubled visibly once `outlineWidth >= 1`. `outlineWidth` is now an even stroke width in logical pixels at any value.
+
+## [1.1.0] - 2026-06-12
+
+The performance release: every item of `PERFORMANCE_ROADMAP.md` is
+implemented and verified on physical devices (Galaxy S21, iPhone 13 Pro
+Max) — full before/after measurements live in the roadmap's "Final A/B
+comparison" section. All new behavior is opt-in; defaults are unchanged
+except for the two leak fixes below, which apply automatically.
+
+### Added
+- **Lightweight inline views** (`NativeVideoPlayerConfig.lightweightInlineViews`, default off): views created with native controls hidden (`showNativeControls: false` or a custom `overlayBuilder`) host a bare video surface — `UIView` + `AVPlayerLayer` on iOS instead of a per-tile `AVPlayerViewController`, `SurfaceView` + `AspectRatioFrameLayout` (+ `SubtitleView` for captions) on Android instead of a full Media3 `PlayerView`. Measured on the N=6 stress feed (iOS simulator): janky frames 37% → 24%, average frame total 9.1ms → 6.6ms. PiP, Now Playing, fullscreen, subtitles, and the native sidecar caption handoff keep working. Limitation: `setShowNativeControls(true)` at runtime is ignored for a view created lightweight.
+- **Android disk cache + precache** (`androidEnableDiskCache`, default off): opt-in Media3 `SimpleCache` (LRU-evicted, `androidDiskCacheMaxBytes`, default 100MB) wrapped around playback and quality-switch data sources, plus `NativeVideoPlayerCache.precache(url)` to warm upcoming feed items up to `androidPrecacheBytes` (default 2MB; HLS precaching covers the playlists and leading segments). DRM and non-HTTP sources bypass the cache; cached items replay offline. Silent no-op on iOS.
+- **Texture rendering mode** (experimental: `androidTextureMode` / `iosTextureMode`, default off): inline tiles with hidden native controls render as Flutter textures — `TextureRegistry.createSurfaceProducer()` on Android (Impeller-compatible), `FlutterTexture` + `AVPlayerItemVideoOutput` on iOS (BT.709-correct, AES-HLS compatible). Feed scrolling stops fighting platform-view gesture claiming and hybrid-composition overhead disappears. Automatic platform-view fallback preserves every capability: tiles with automatic PiP stay (light) platform views; manual `enterPictureInPicture()` from a texture tile live-swaps the tile to a platform view (same shared player) before starting PiP; fullscreen falls back to the Dart fullscreen player; FairPlay DRM requires platform-view mode. New `controller.videoSizeStream` reports the natural video size (used for texture letterboxing, available in all modes on Android and in texture mode on iOS).
+- **`NativeVideoPlayerConfig.viewportCapHeadroom`** (iOS, default 1.5): controls the headroom multiplier of the viewport quality cap. 1.5 keeps the first HLS variant at-or-above the tile size selectable (visually lossless); 1.0 maximizes savings.
+
+### Fixed
+- **iOS platform views now deallocate when disposed.** Every platform view was permanently retained by its per-view EventChannel handler registration (the engine's handler block strongly captures the view and was never deregistered), so a view's `deinit` could never run — each created view leaked along with its notification observers. The Dart widget now notifies the native side on platform-view disposal (`viewDisposed`), which deregisters the per-view channels and lets the view deallocate; KVO registration is now bookkept so teardown removes exactly what was added (re-loads no longer stack duplicate item/player observers either). Verified with `heap(1)`: view counts return to baseline after open/close cycles, in both display modes.
+- **`dispose()` no longer leaks the native player when it races platform-view teardown.** Disposing a controller routed the native release through the view-bound `dispose` call, which lands after the platform view unregisters when a tile unmounts (`NO_VIEW`, silently swallowed) — leaking one fully-buffered native player per disposed controller. On a Galaxy S21 this OOM-killed the app after a few feed visits (Java heap ratcheting ~+1.1MB per visit, MediaCodec allocation failure at the 256MB limit). `dispose()` now always issues the controller-ID-routed `disposeController` as the authoritative release (idempotent on both platforms). Measured after the fix: heap flat across six feed re-entries (6.2→6.3MB) vs the baseline's monotonic 4.6→12.6MB climb. Pre-existing on 1.0.1.
+
+## [1.0.1] - 2026-06-11
+
+### Changed
+- Removed internal development notes from the repository and package archive; clarified a few doc comments. No functional changes.
+
+## [1.0.0] - 2026-06-11
+
+First stable release. Everything below is additive — no breaking changes to
+the existing controller/widget API.
+
+### Added
+- **Sidecar subtitles**: load external VTT/SRT files (URL, local file, or raw content) via `load(sidecarSubtitles:)` or `setSidecarSubtitles()`, rendered in a fully styleable Flutter overlay (`NativeVideoPlayerSubtitleStyle`). Sidecar and embedded HLS tracks are merged into one list (`getAvailableSubtitleTracks()` / `setSubtitleTrack()`). On Android, sidecar sources are also sideloaded natively so captions stay visible in PiP and native fullscreen.
+- **Audio track selection**: `getAvailableAudioTracks()` / `setAudioTrack()` for multi-audio HLS streams, with an `audioTrackChanged` control event.
+- **Chromecast** (separate `package:better_native_video_player_plus/cast.dart` entrypoint): pure-Dart CASTV2 session — load with metadata and caption tracks, play/pause/seek/stop, volume/mute, caption switching, looping, and a live `statusStream` reflecting receiver-side changes. Device discovery uses the system Bonjour browser on iOS (works on physical devices without the restricted multicast entitlement) and pure-Dart mDNS elsewhere.
+- **Offline downloads**: `VideoDownloadController` with progress streams, persistent index, cancel/remove, and `localPathFor()` for offline playback.
+- **Resume positions**: `load(startAt:)` applied natively before the first frame, plus `PositionCheckpoints` for throttled position persistence.
+- **A-B playback ranges**: `setPlaybackRange(start, end, loop:)` / `clearPlaybackRange()`.
+- **Playlists**: `NativeVideoPlayerPlaylist` with auto-advance and per-item startAt.
+- **Playback analytics**: `PlaybackAnalytics` QoE event stream (startup time, stalls, watched time, quality switches, completion).
+- **Background playback guard**: `BackgroundPlaybackGuard` pauses on background and resumes on foreground (PiP/AirPlay exempt).
+- **Scrub-preview storyboards**: `StoryboardThumbnails` parses WebVTT storyboards and uniform sprite grids (Vimeo/Bunny style); example ships a drag-to-preview seek bar.
+- **Performance configuration**: `NativeVideoPlayerConfig` with concurrent-playback caps, viewport-based HLS quality capping, buffer presets, and Android playback prioritization.
+- **Companion package** `better_native_video_extractor` (in-repo): WebView-free Vimeo/YouTube extraction (Referer support, thumbnails, storyboards, expiry-aware cache, extraction-failure event stream).
+- Example app: AirPlay + subtitles test bench, Chromecast remote-control screen, downloads screen, audio/sidecar/extractor/playlist/player-features demos.
+
+### Fixed
+- Chromecast discovery crashed with an unhandled `SocketException` on physical iPhones; scans now run natively (iOS) and failures surface as a catchable `CastDiscoveryException` with actionable guidance.
+- Chromecast seek snapping the position back to zero (receiver statuses without `currentTime` were treated as position 0; seeking exactly at the duration finished the stream).
+- Vimeo playback compatibility: the extractor prefers the H.264 `avc_url` HLS variant (AVPlayer could fail to decode the default variant).
+
+### Changed
+- Internal refactors for maintainability: the iOS method handler is split into topical files and the Dart controller's event plumbing into a part file. No public API changes.
+
+## [0.4.11] - 2026-01-27
+
+### Added
+- **Swipe to dismiss**: Fullscreen video player can now be dismissed by swiping down.
+
+### Fixed
+- **Black screen**: Resolved black screen during video playback on iOS and Android.
+- **Black screen after fullscreen**: Fixed black screen that could occur after exiting fullscreen mode.
+
+## [0.4.10] - 2026-01-27
+
+### Fixed
+- **Audio focus timing**: Video now requests audio focus only when playback starts, not during initialization. Avoids unnecessary audio focus grabs when the player is created but not yet playing, improving behavior when multiple audio sources are present.
+
+## [0.4.9] - 2026-01-15
+
+### Improved
+- **Initialization Logic Enhancement**: Enhanced initialization logic in NativeVideoPlayerController
+  - Updated the initialization check to consider the presence of the method channel and platform view IDs, allowing for a more flexible initialization process
+  - Improved the completion handling of the initialization completer to ensure it is only completed if not already done, preventing potential issues during the initialization phase
+
+## [0.4.8] - 2026-01-15
+
+### Improved
+- **Android VideoPlayerObserver Refactoring**: Refactored VideoPlayerObserver to avoid redundant loading events
+  - Updated comments to clarify that the "loaded" event is already sent by `onPlaybackStateChanged` when the player reaches `STATE_READY`
+  - Eliminates duplicate event emissions for better event handling efficiency
+  - Improved code clarity and documentation
+
+## [0.4.7] - 2026-01-14
+
+### Added
+- **DRM (Digital Rights Management) Support**: Comprehensive DRM support for protected content playback
+  - **FairPlay Streaming** support on iOS with certificate and license server configuration
+  - **Widevine** support on Android for protected content playback
+  - **AES-128** (Standard HLS Encryption) support on both platforms
+  - **ClearKey** DRM support for testing and development
+  - DRM configuration via `drmConfig` parameter in `load()`, `loadUrl()`, and `loadFile()` methods
+  - License server URL configuration for all DRM types
+  - Certificate URL support for FairPlay (iOS) with automatic certificate fetching
+  - Custom HTTP headers for license requests (authentication tokens, etc.)
+  - VideoPlayerDrmHandler class for DRM setup and license requests on iOS
+  - Comprehensive DRM handling in VideoPlayerMethodHandler for both iOS and Android
+  - Picture-in-Picture (PiP) state notifications in video player UI
+
+## [0.4.6] - 2025-12-29
+
+### Fixed
+- **Event Thread Safety**: Fixed event sending to ensure thread safety on both platforms
+  - Android: Events now sent on main thread using `Handler(Looper.getMainLooper())`
+  - iOS: Events now sent on main queue using `DispatchQueue.main.async`
+  - Prevents potential crashes or race conditions when events are sent from background threads
+  - Ensures UI updates happen on the correct thread for better stability
+
+- **Subscription Cancellation Safety**: Fixed potential exceptions during controller disposal
+  - Added `_safeCancelSubscription()` method to gracefully handle `MissingPluginException` during disposal
+  - Prevents errors when native side has already disposed EventChannel StreamHandler
+  - Improves reliability of controller cleanup and resource management
+
+## [0.4.5] - 2025-12-29
+
+### Added
+- **Native Controls Visibility Control**: Added `showNativeControls` parameter to `NativeVideoPlayerController` constructor
+  - Defaults to `true` to maintain backward compatibility
+  - When set to `false`, native controls are hidden
+  - Custom overlays automatically hide native controls regardless of this setting
+  - Provides fine-grained control over native control visibility
+
+### Improved
+- **Code Quality and Formatting**: Enhanced code formatting and consistency across the controller
+  - Improved line formatting and spacing throughout `NativeVideoPlayerController`
+  - Better code readability with consistent formatting patterns
+  - Removed unnecessary line breaks for cleaner code structure
+
+### Fixed
+- **Event Thread Safety**: Fixed event sending to ensure thread safety on both platforms
+  - Android: Events now sent on main thread using `Handler(Looper.getMainLooper())`
+  - iOS: Events now sent on main queue using `DispatchQueue.main.async`
+  - Prevents potential crashes or race conditions when events are sent from background threads
+  - Ensures UI updates happen on the correct thread for better stability
+
+## [0.4.4] - 2025-12-29
+
+### Improved
+- **Code Quality and Formatting**: Enhanced code formatting and consistency across the controller
+  - Improved line formatting and spacing throughout `NativeVideoPlayerController`
+  - Better code readability with consistent formatting patterns
+  - Removed unnecessary line breaks for cleaner code structure
+  - Improved import organization
+
+### Fixed
+- **Initialization Check**: Fixed initialization check in `load()` method to use `_isInitialized` flag instead of state check
+  - More reliable initialization validation before loading video
+  - Prevents potential issues when checking controller readiness
+
+## [0.4.3] - 2025-12-29
+
+### Fixed
+- **iOS Background Playback**: Fixed video playback stopping when device goes to background or screen locks
+  - Added `audiovisualBackgroundPlaybackPolicy` configuration to allow playback to continue in background (iOS 15.0+)
+  - Configured both shared players and standalone players for background playback
+  - Video now continues playing when device is locked or app goes to background
+  - Ensures seamless playback experience during background transitions
+
+## [0.4.2] - 2025-11-27
+
+### Added
+- **Automatic Inline Picture-in-Picture**: New methods to enable/disable automatic PiP when app goes to background
+  - Added `enableAutomaticInlinePip()` method to automatically start PiP when app goes to background
+  - Added `disableAutomaticInlinePip()` method to turn off automatic PiP behavior
+  - iOS: Uses `canStartPictureInPictureAutomaticallyFromInline` (requires iOS 14.2+)
+  - Android: Integrates with the existing floating package for automatic PiP on home button press (requires Android 8+)
+  - Automatic PiP settings persist across view recreations for shared players
+  - Comprehensive platform checks and error handling with descriptive messages
+  - Manual PiP controls via `enterPictureInPicture()` remain fully functional
+
+### Improved
+- **iOS Automatic PiP State Management**: Enhanced SharedPlayerManager to store automatic PiP settings
+  - Added `setAutomaticPiPEnabled()` method to persist automatic PiP preference per controller
+  - Settings are maintained when views are recreated with shared controllers
+  - Better logging for debugging automatic PiP activation
+
+## [0.4.1] - 2025-11-25
+
+### Changed
+- Version bump and maintenance release
+
+## [0.4.0] - 2025-11-25
+
+### Added
+- **Subtitle/Closed Caption Support**: Comprehensive subtitle functionality for HLS streams
+  - Added `NativeVideoPlayerSubtitleTrack` model with language code and display name
+  - Added `getSubtitleTracks()` method to retrieve available subtitle tracks
+  - Added `setSubtitleTrack()` method to select a specific subtitle track or disable subtitles
+  - iOS: Uses AVFoundation's `AVMediaSelectionGroup` for native subtitle track management
+  - Android: Uses ExoPlayer's text track selection API for subtitle rendering
+  - Support for both VOD and Live HLS streams with embedded subtitles
+  - Support for WebVTT and standard HLS subtitle formats on both platforms
+  - Added `SubtitlePickerModal` widget with beautiful Material Design UI
+  - Font size control (12-32px) for subtitle customization
+  - Language selection with localized display names
+  - Enable/disable subtitles toggle
+  - Integrated subtitle picker into custom video overlay controls
+  - Added comprehensive subtitle example screen demonstrating VOD and Live HLS streams
+
+### Improved
+- **Example App**: Enhanced with subtitle examples and better UI organization
+  - Added `subtitle_example_screen.dart` with multiple subtitle examples
+  - Updated `video_list_screen_with_players.dart` with subtitle track access
+  - Cleaned up example code for better maintainability
+
+### Documentation
+- Updated README with detailed subtitle documentation and usage examples
+- Added API reference for subtitle-related methods
+- Included examples for getting available tracks and selecting subtitle languages
+
+## [0.3.10] - 2025-11-20
+
+### Improved
+- **AirPlay State Manager Initialization**: Enhanced initialization flow to support app startup initialization
+  - Added `_initRequested` flag to track initialization requests before controllers are created
+  - `AirPlayStateManager.init()` can now be safely called at app startup before creating any video player controllers
+  - Automatic AirPlay detection now starts when the first controller is created if `init()` was called earlier
+  - Removed `StateError` exception when calling `init()` without available controllers
+  - Improved developer experience by allowing flexible initialization timing
+  - Added proper cleanup of `_initRequested` flag in `dispose()` method
+
+### Documentation
+- Updated `init()` method documentation to clarify safe usage at app startup
+- Improved comments explaining automatic initialization behavior when channels become available
+
+## [0.3.9] - 2025-11-20
+
+### Fixed
+- **Android AirPlay Method Handlers**: Fixed missing method handlers causing errors when calling AirPlay methods on Android
+  - Added `startAirPlayDetection()` method handler (no-op on Android, returns success)
+  - Added `stopAirPlayDetection()` method handler (no-op on Android, returns success)
+  - Added `disconnectAirPlay()` method handler (no-op on Android, returns success)
+  - Fixed "No video player controller available" error when calling `AirPlayStateManager.instance.init()` on Android
+
+### Improved
+- **AirPlay State Manager Platform Safety**: Enhanced platform checking for better cross-platform compatibility
+  - Added platform checks to all AirPlay methods (`init()`, `showAirPlayPicker()`, `disconnectAirPlay()`, `dispose()`)
+  - Methods now return early without error on non-iOS platforms (Android, Web)
+  - AirPlay methods are now safe to call on any platform without platform-specific guards
+  - Improved documentation to clarify iOS-only functionality with cross-platform safety
+
+## [0.3.8] - 2025-11-20
+
+### Added
+- **HLS Live Stream Support**: Full support for HLS live streams with indefinite duration
+  - iOS: Uses `seekableTimeRanges` to calculate duration and position for live content
+  - Android: Uses `Timeline.Window` to handle dynamic, non-seekable live streams
+  - Position and duration now calculated relative to the seekable window for live streams
+  - Proper detection of live vs VOD content (including VOD HLS)
+  - Accurate time updates and progress reporting for live streams
+
+### Improved
+- **iOS Autoplay Reliability**: Enhanced autoplay functionality with proper initialization
+  - Added `prepareForPlayback()` method that consolidates audio session, Now Playing info, and PiP setup
+  - Autoplay now properly prepares audio session and media controls before starting playback
+  - Ensures playback rate is set correctly during autoplay
+  - Now Playing info is properly initialized before video starts
+
+- **iOS Background Audio During Screen Lock**: Major improvements to maintain playback when screen locks
+  - Player now actively resumes playback after screen lock transition completes
+  - Added 100ms delay to ensure background transition completes before resuming
+  - Stores playback state before lock to restore correctly
+  - Sets playback rate to `desiredPlaybackSpeed` when resuming after lock
+  - Fixes issue where iOS would pause video when device locks
+
+- **iOS Audio Session Management**: Enhanced audio session preparation for remote commands
+  - Audio session is now prepared before resuming playback in Now Playing handler
+  - Critical for proper playback after interruptions (phone calls, alarms)
+  - Ensures audio session is active when handling remote control commands
+
+- **Android Autoplay Timing**: Fixed autoplay to happen after player is ready
+  - Moved `player.play()` call to execute only after `STATE_READY` is reached
+  - Prevents autoplay attempts before player has loaded media
+  - Play event is now sent automatically by `VideoPlayerObserver` after successful play
+  - More reliable autoplay behavior across different video formats
+
+### Fixed
+- **HLS Live Stream Position**: Fixed incorrect position and duration reporting for live streams
+  - Live streams no longer show indefinite or incorrect duration values
+  - Position now properly tracks within the seekable window
+  - Prevents position from going negative or exceeding duration
+
+- **iOS Screen Lock Playback**: Fixed video audio stopping when screen locks during playback
+  - Playback now continues seamlessly when device locks
+  - Audio maintains at correct playback speed after lock
+  - Resolves interruption in background audio during screen lock transitions
+
+### Technical Details
+- **iOS Implementation**: Enhanced time observer to detect indefinite duration and use seekable ranges
+- **Android Implementation**: Added Timeline and Window inspection to differentiate live from VOD content
+- **Example App**: Added CNN livestream example with autoplay enabled for testing
+
+## [0.3.7] - 2025-11-19
+
+### Added
+- **iOS Global AirPlay Device Detection**: Enhanced AirPlay monitoring with global route detection
+  - Added `AirPlayStateManager.init()` method to start global AirPlay device detection at app startup
+  - Added `startAirPlayDetection()` and `stopAirPlayDetection()` native methods in `SharedPlayerManager`
+  - Global `AVRouteDetector` monitors AirPlay device availability across the entire app
+  - AirPlay availability events now sent from shared manager to all controllers
+  - Improved device discovery with centralized detection logic
+  - Added `setMethodChannel()` to enable event communication from shared manager
+
+### Improved
+- **iOS Audio Session Management**: Major enhancements to background audio and lock screen playback
+  - Added `prepareAudioSession()` method for centralized audio session configuration
+  - Critical fix: Audio session now activated BEFORE calling `player.play()` to ensure lock screen playback
+  - Added `handleAppDidEnterBackground()` observer to maintain audio session when screen locks
+  - Audio session stays active during screen lock to prevent iOS from pausing video
+  - Better audio session error handling with detailed logging
+  - Consolidated audio session setup in initialization and play methods
+
+- **iOS Audio Interruption Handling**: Enhanced handling of phone calls, alarms, and other audio interruptions
+  - Added auto-resume functionality when system recommends resumption after interruption
+  - Better detection of interruption end with `shouldResume` flag handling
+  - Improved Now Playing info restoration after audio session reactivation
+  - Ensures playback continues correctly after interruptions when appropriate
+
+- **Android Error Handling**: Better PiP event listener error management
+  - Improved error handling for MainActivity PiP events (non-critical errors)
+  - Fixed platform check ordering to prevent unnecessary iOS errors
+  - Added `cancelOnError: false` to prevent event stream from stopping on error
+  - Better debug logging for `MissingPluginException` cases
+
+- **AirPlayStateManager Lifecycle**: Enhanced initialization and disposal
+  - `dispose()` now stops AirPlay detection before cleaning up resources
+  - `init()` provides clear API for starting AirPlay detection at app startup
+  - Better error handling during disposal to prevent crashes
+  - Cleaner resource cleanup with proper detection stop
+
+### Fixed
+- **iOS Lock Screen Audio**: Fixed video audio stopping when screen locks
+  - Audio session now properly configured before playback starts
+  - Background audio maintained correctly during screen lock transitions
+  - Prevents iOS from automatically pausing playback when device locks
+
+### Documentation
+- Added usage examples for `AirPlayStateManager.init()` in code documentation
+- Updated `prepareAudioSession()` with detailed explanation of importance
+- Improved comments explaining critical audio session activation timing
+
+## [0.3.6] - 2025-11-17
+
+### Added
+- **Android PiP Enhancement**: Integrated `floating` package (version 6.0.0) for improved Picture-in-Picture functionality on Android
+  - Automatic PiP management with seamless transitions
+  - Simplified PiP implementation using the floating package
+
+### Improved
+- **Android PiP Implementation**: Major refactor of Android Picture-in-Picture handling
+  - Removed legacy PiP handling code, simplifying the codebase
+  - Enhanced NativeVideoPlayerController to utilize the floating package for PiP management
+  - Better PiP user experience with automatic handling
+
+### Changed
+- Updated dependencies with floating package for Android PiP support
+- Code formatting improvements across the codebase
+
+### Documentation
+- Updated documentation to reflect new automatic PiP integration and requirements
+
+## [0.3.5] - 2025-11-17
+
+### Changed
+- Version bump and maintenance release
+- Code formatting and quality improvements
+
+## [0.3.4] - 2025-11-16
+
+### Added
+- **Global AirPlay State Management**: Complete refactor to use centralized AirPlay state across all video player instances
+  - Added `AirPlayStateManager` singleton service for global AirPlay state management
+  - Added `airPlayDeviceName` property with stream support to track connected AirPlay device name
+  - Added `isAirplayConnecting` state to track connection progress between device selection and streaming
+  - Added `AirPlayStateManager.instance.showAirPlayPicker()` - Show AirPlay picker from anywhere in the app
+  - Added `AirPlayStateManager.instance.disconnectAirPlay()` - Disconnect from AirPlay globally
+  - Added `controller.disconnectAirPlay()` method for programmatic AirPlay disconnection
+  - Controllers now delegate to global manager for consistent state across all instances
+
+### Improved
+- **iOS AirPlay Device Name Detection**: Enhanced reliability with robust retry mechanism
+  - Implemented multi-attempt retry with exponential backoff (4 attempts: 0.1s, 0.3s, 0.6s, 1.0s delays)
+  - Added smart device name caching to prevent null values during temporary iOS audio route updates
+  - Comprehensive logging for audio route inspection and device detection
+  - Device names persist correctly even when iOS has timing issues with audio route updates
+  - Retry logic used in both initial state detection and audio route change events
+
+- **iOS AirPlay State Emission**: Improved state synchronization across multiple controllers
+  - New controllers immediately receive current global AirPlay state on subscription
+  - Modified stream getters to emit current state immediately to new subscribers
+  - All controllers stay synchronized regardless of creation order
+  - Fixed issue where AirPlay state was only visible on first controller
+
+- **iOS AirPlay Connection Detection**: Enhanced initial connection state handling
+  - Checks both player-level and system-level (audio route) AirPlay state on initialization
+  - Correctly detects existing AirPlay connections when new players are created
+  - Emits initial connection state even if AirPlay was active before player initialization
+  - Added audio route change observer to track AirPlay device switches
+
+- **iOS AirPlay Connecting State Logic**: Fixed inconsistent state detection
+  - Unified logic between initial state check and audio route change handler
+  - Consistently checks both `player.isExternalPlaybackActive` and system audio route
+  - Added detailed debug logging showing playerActive, systemActive, connected, and connecting states
+
+### Fixed
+- **iOS AirPlay Connecting State**: Fixed `isAirPlayConnecting` incorrectly showing true when connected and playing
+  - Audio route change handler now uses same detection logic as initial state check
+  - `isConnecting` properly calculated as: systemActive AND NOT playerActive AND isConnected
+  - Prevents showing "connecting" UI when already connected and playing
+  - Fixed state calculation issues during audio route changes while connected
+
+- **iOS Redundant State Updates**: Prevented unnecessary global state updates with multiple controllers
+  - Added pre-checks before calling `updateConnection()` and `updateAvailability()`
+  - Only updates global state if values differ from current state
+  - Prevents duplicate stream emissions when multiple controllers report same state
+  - Maintains single source of truth in `AirPlayStateManager`
+
+### Technical Details
+- **iOS Implementation**: Added `getAirPlayDeviceName()` method using `AVAudioSession` to detect device names
+- **iOS Audio Route Handling**: Added `handleAudioRouteChange()` observer for device switching and state monitoring
+- **Flutter State Model**: Extended with `airPlayDeviceName` and `isAirplayConnecting` properties
+- **API Compatibility**: Backward compatibility maintained for controller-level listener handlers
+- **Event Protocol**: Updated `airPlayConnectionChanged` event to include `deviceName` parameter
+
+### Breaking Changes
+- AirPlay state is now global across all video player instances (shared via `AirPlayStateManager`)
+- All controllers see the same AirPlay state regardless of which controller initiated the connection
+- This change provides more accurate representation of system-level AirPlay connectivity
+
+## [0.3.3] - 2025-11-12
+
+### Improved
+- **iOS Picture-in-Picture Multi-View Handling**: Enhanced PiP functionality when using multiple views with shared controllers
+  - Added checks for active PiP across multiple views to prevent conflicts
+  - Improved PiP stopping actions to work correctly even when navigating between views
+  - Better error handling for cases where no active PiP is found
+  - Enhanced user experience by ensuring PiP can be stopped from any active view
+
+- **iOS Picture-in-Picture Reliability**: Major improvements to PiP start/stop mechanisms
+  - Implemented retry mechanism for starting PiP with detailed logging for attempts and outcomes
+  - Enhanced automatic PiP handling with improved player state detection
+  - Better PiP activation and transfer logic to improve reliability during playback
+  - Added comprehensive diagnostics and logging for debugging PiP transitions
+
+- **iOS Audio Session Interruption Handling**: Added robust handling for audio session interruptions
+  - Implemented observer for audio session interruptions (e.g., phone calls, alarms)
+  - Automatic reactivation of audio session after interruption ends
+  - Restoration of Now Playing info post-interruption
+  - Enhanced logging for better tracking of audio session states during playback
+
+- **iOS Now Playing Info Persistence**: Comprehensive improvements to media control reliability
+  - Implemented foreground notification handling to restore Now Playing info when app returns from background
+  - Added fallback mechanism to retrieve media info from SharedPlayerManager when local data is unavailable
+  - Enhanced media info retrieval in VideoPlayerObserver for accurate Now Playing info during playback
+  - Improved PiP restoration logic with proper cleanup during view disposal
+  - Media info now persists correctly when PiP is active or during restoration transitions
+  - Added `isPipActiveForController` method to check PiP status across all views for a controller
+
+- **iOS Remote Command Management**: Enhanced reliability of media control registration
+  - Refined remote command re-registration logic to prevent unnecessary re-registration
+  - Added ownership status checks before re-registering commands
+  - Introduced flag to track registration status for better management during ownership transfers
+  - Force re-registration capability with immediate and delayed verification checks
+  - Improved Now Playing info accuracy with better tracking of command status
+
+- **iOS Audio Session Activation**: Enhanced audio session handling for Now Playing info
+  - Activate audio session in VideoPlayerNowPlayingHandler to ensure info displays correctly
+  - Added error handling for session activation to improve reliability
+  - Added playback rate logging and detailed checks for audio session state
+  - Comprehensive diagnostics for remote command targets and Now Playing info completeness
+
+### Fixed
+- **iOS Now Playing Controls**: Fixed media controls becoming unresponsive after various transitions
+  - Fixed Now Playing info not displaying after returning from background
+  - Fixed media info being lost during PiP restoration
+  - Fixed remote command targets not being properly re-registered during ownership transfers
+  - Prevents "Unknown" or blank media info from appearing in Control Center and lock screen
+
+- **iOS HDR Performance**: Removed outdated HDR correction code for improved performance optimization
+
+## [0.3.2] - 2025-11-10
+
+### Changed
+- **HDR Enabled by Default**: Changed `enableHDR` default value from `false` to `true`
+  - HDR content will now display with proper HDR rendering by default
+  - Set to `false` if you prefer SDR tone-mapping for HDR content
+
+### Improved
+- **iOS Media Info Persistence**: Enhanced media info handling during Picture-in-Picture transitions
+  - Added media info caching in SharedPlayerManager to persist across view recreations
+  - Media info now survives view disposal during PiP mode
+  - Ensures Now Playing controls remain functional with correct title/subtitle during PiP
+  - Prevents media info from being cleared when transitioning between views
+  - Media info automatically stored when loading video and persists throughout controller lifetime
+
+- **iOS Manual PiP vs Automatic PiP**: Added tracking to prevent conflicts between manual and automatic PiP
+  - Added `controllersWithManualPiP` tracking in SharedPlayerManager
+  - Prevents automatic PiP from interfering when user manually enters PiP
+  - Automatic PiP re-enabling skipped when manual PiP is active
+  - Improves reliability when using both PiP modes in the same app
+
+- **iOS PiP State Tracking**: Enhanced PiP state detection and handling
+  - Added `isPipCurrentlyActive` flag to VideoPlayerView for reliable PiP state tracking
+  - Better synchronization between PiP controller state and view state
+  - Improved cleanup logic when view is disposed while PiP is active
+  - More accurate detection of PiP transitions for proper event delivery
+
+- **Code Quality**: Code formatting improvements across Flutter controller
+  - Removed unnecessary line breaks for cleaner code structure
+  - Better readability with consistent formatting
+  - Improved maintainability of the codebase
+
+### Fixed
+- **iOS Media Controls During PiP**: Fixed media controls becoming unresponsive during PiP transitions
+  - Media info no longer cleared from SharedPlayerManager when view is disposed during PiP
+  - Lock screen and Control Center controls remain functional throughout PiP lifecycle
+  - Prevents "Unknown" or blank media info from appearing in system controls
+
+## [0.3.1] - 2025-11-09
+
+### Fixed
+- **iOS Picture-in-Picture Event Delivery**: Fixed issue where PiP stop events could fail when exiting PiP with disposed views
+  - Added `findAllViewsForController()` method to SharedPlayerManager to locate active views for a controller
+  - Enhanced PiP stop event handling to fallback to alternative active views when primary view is disposed
+  - Fixed `pictureInPictureController:restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:` to handle disposed views
+  - Now attempts to find and restore UI on alternative active views with the same controller
+  - Completes with false when no active view exists, allowing iOS to exit PiP gracefully
+  - Added PiP state detection in `deinit` to send pipStop events before view disposal
+  - Ensures pipStop events are always delivered when exiting PiP, even with disposed or inactive views
+  - Prevents app crashes or inconsistent state when exiting PiP after navigating away from video view
+
+## [0.3.0] - 2025-11-08
+
+### Added
+- **Video Looping Support**: Comprehensive video looping functionality with smooth native playback
+  - Added `enableLooping` parameter to `NativeVideoPlayerController` constructor (default: false)
+  - Added `setLooping(bool)` method for dynamic looping control during playback
+  - Android uses ExoPlayer's `REPEAT_MODE_ONE` for seamless native looping
+  - iOS implements looping via seek to beginning and automatic replay without gaps
+  - Smooth looping without visible pause or stuttering across both platforms
+
+- **Multiple Video Format Support**: Extended support beyond HLS streams
+  - Added support for MP4 video URLs (remote)
+  - Added support for local video files (file:// URIs)
+  - Android uses `ProgressiveMediaSource` for non-HLS content
+  - iOS AVPlayer natively supports multiple formats (MP4, MOV, M4V)
+  - Android supports additional formats (WebM, MKV)
+  - Added `isHlsUrl()` helper function for improved format detection on both platforms
+  - Quality selection remains available for HLS streams
+
+- **Convenience Loading Methods**: New explicit methods for improved API clarity
+  - Added `loadUrl({required String url, Map<String, String>? headers})` for remote videos
+  - Added `loadFile({required String path})` for local files (automatically constructs file:// URIs)
+  - Existing `load()` method remains for backward compatibility
+  - Better IDE autocomplete and discoverability
+
+- **Asset Video Support**: Local video file playback from Flutter assets
+  - Implemented new MethodChannel for resolving asset paths on both platforms
+  - Assets are automatically extracted to cache directory for playback
+  - Seamless integration with existing loading methods
+  - Added example with local asset (ElephantsDream.mp4)
+
+### Improved
+- **iOS Media Controls**: Fixed critical issues with native media controls across multiple scenarios
+  - Fixed MPRemoteCommandCenter conflicts when using multiple videos with shared controllers
+  - Added `RemoteCommandManager` singleton to centralize ownership of remote commands
+  - Remote command ownership now tracked by viewId instead of media title for reliability
+  - Fixed media controls becoming unresponsive when entering/exiting PiP
+  - Fixed lock screen controls showing incorrect media info or becoming unresponsive
+  - Proper cleanup of remote command targets in deinit to prevent dangling references
+  - Remote command handlers now verify ownership before processing events
+  - Fixed periodic observer conflicts causing incorrect Now Playing info updates
+
+- **Remote Command Ownership Transfer**: Automatic management between multiple views
+  - Only the "owner" view can register remote command handlers and update Now Playing info
+  - Ownership automatically transfers when entering/exiting PiP
+  - Prevents conflicts when multiple VideoPlayerView instances exist simultaneously
+  - Ensures consistent media control behavior across app lifecycle
+
+### Fixed
+- **iOS Now Playing Info Persistence**: Fixed Now Playing info disappearing or showing wrong data
+  - Now Playing ownership no longer fails with duplicate titles or disposed views
+  - Media controls remain functional when switching between videos
+  - Lock screen and Control Center always show correct media information
+
+- **Race Conditions**: Consolidated cleanup logic to prevent race conditions
+  - Better synchronization between view lifecycle and remote command management
+  - Improved timing of ownership transfers during PiP transitions
+
+- **HLS Detection**: Improved quality switching and HLS stream detection
+  - More reliable detection of HLS vs progressive video formats
+  - Quality fetching only attempted for actual HLS streams
+  - Better logging for source type detection and debugging
+
+### Documentation
+- Updated README with "Supported Video Formats" section
+- Added examples for HLS, MP4, and local file usage
+- Updated feature list to highlight multi-format support
+- Added test URLs for both HLS and MP4 formats
+- Updated API Reference with new convenience methods
+- Added path_provider example for local file handling
+- Updated example app with mixed HLS and MP4 examples
+
+## [0.2.20] - 2025-11-06
+
+### Improved
+- **Android Auto Picture-in-Picture**: Major enhancements to automatic PiP mode when pressing home button
+  - Unified PiP entry logic with single `enterPictureInPictureInternal()` method that handles both manual and automatic triggers
+  - Removed `setAutoEnterEnabled(true)` which was bypassing custom PiP logic and `onUserLeaveHint` callback
+  - Improved fullscreen transition before PiP entry - now enters fullscreen silently without sending intermediate events
+  - Added `onStop()` lifecycle method in example MainActivity to catch auto PiP on devices where `onUserLeaveHint` isn't reliably called
+  - Better source rect calculation for PiP window positioning when transitioning from fullscreen
+  - Enhanced logging throughout PiP flow for better debugging
+  - Auto PiP now enabled by default in example app with proper state tracking
+
+- **Android MainActivity Configuration**: Cleaned up example app MainActivity
+  - Removed `android:taskAffinity=""` from AndroidManifest which could cause activity lifecycle issues
+  - Added `isInPipMode` flag to track PiP state across lifecycle methods
+  - Created unified `tryEnterAutoPip()` method called from both `onUserLeaveHint` and `onStop`
+  - Improved PiP state restoration with immediate event emission after exiting PiP
+  - Enhanced logging with warning emojis for better visibility in logcat
+
+### Fixed
+- **Android 12+ PiP Behavior**: Fixed `setAutoEnterEnabled` causing Android to automatically enter PiP without proper custom logic
+  - Android's auto-enter was bypassing the plugin's fullscreen transition and state management
+  - Now uses only `setSeamlessResizeEnabled` for smooth transitions while maintaining control over PiP entry
+  - Ensures proper event flow and state synchronization when entering PiP
+
+- **Auto PiP Reliability**: Fixed auto PiP not working reliably on all Android devices
+  - Added fallback to `onStop()` when `onUserLeaveHint()` isn't called (device-specific behavior)
+  - Better detection of home button press across different Android versions and manufacturers
+  - Prevents entering PiP when activity is finishing (back button vs home button)
+
+## [0.2.19] - 2025-11-06
+
+### Improved
+- **Video Completion Behavior**: Enhanced video completion handling to provide better user experience
+  - Video now automatically resets to the beginning when playback completes
+  - Player automatically pauses after completion instead of staying in ended state
+  - Applies to both iOS (AVPlayer) and Android (ExoPlayer) platforms
+  - Ensures consistent behavior across platforms for replay scenarios
+
+- **Android State Restoration After Exiting PiP**: Enhanced state synchronization when exiting Picture-in-Picture mode
+  - Added `emitCurrentState()` method to re-emit all player states after PiP exit
+  - Ensures UI components receive accurate position, duration, buffered position, and playback state
+  - Automatically emits current timeUpdate with buffering state
+  - Emits current play/pause state to synchronize UI controls
+  - Prevents UI from displaying stale state after returning from PiP mode on Android
+
+## [0.2.18] - 2025-11-05
+
+### Fixed
+- **State Restoration After Exiting PiP**: Fixed issue where player state would not be properly restored after exiting Picture-in-Picture mode
+  - Added `emitCurrentState()` method on both iOS and Android to re-emit all player states after PiP exit
+  - Ensures UI components receive accurate position, duration, buffered position, and playback state
+  - Prevents UI from showing stale or incorrect state after returning from PiP mode
+  - Applies to both platforms when user exits PiP via system gesture or button
+
+### Improved
+- **Code Quality (Flutter)**: Improved code formatting across `NativeVideoPlayerController`
+  - Better line formatting and consistency throughout the codebase
+  - Enhanced readability with improved code organization
+  - Removed unnecessary line breaks for cleaner code structure
+
+### Documentation
+- **Android PiP Setup**: Added comprehensive documentation for required MainActivity PiP callback
+  - Documented why MainActivity callback is necessary for proper PiP state restoration
+  - Added complete code example for MainActivity implementation
+  - Clarified consequences of not implementing the callback
+
+## [0.2.17] - 2025-11-05
+
+### Improved
+- **Code Quality (Android)**: Enhanced import organization in VideoPlayerMethodHandler
+  - Added explicit import for SharedPlayerManager
+  - Simplified fully qualified class name references
+  - Improved code readability and maintainability
+
+## [0.2.16] - 2025-11-04
+
+### Improved
+- **Enhanced Initialization Handling**: Improved controller initialization with better state tracking
+  - Added `_isInitialized` and `_isInitializing` flags to prevent duplicate initialization
+  - Initialize completer now waits properly for existing initialization to complete
+  - Early return when platform view is already created with method channel
+  - Added `isInitialized` getter to check initialization status programmatically
+
+- **Immediate State Emission for New Listeners**: Event listeners now receive current state immediately upon registration
+  - New activity listeners immediately receive current activity state (playing, paused, etc.)
+  - New control listeners immediately receive current position, duration, and buffer state
+  - Eliminates the need to wait for the next event when adding listeners after initialization
+  - Includes debug logging to track listener registration and state emission
+
+- **Duration Persistence During AirPlay**: Fixed duration being lost during AirPlay transitions
+  - Duration is now protected from being overwritten with 0 during AirPlay connection/disconnection
+  - Duration controller explicitly re-emits when AirPlay connects to ensure UI stays updated
+  - Prevents progress bars and time displays from temporarily showing 0:00 during transitions
+
+- **Unified Event Name Handling**: Added support for both 'timeUpdate' and 'timeUpdated' event names
+  - Native platforms can now use either naming convention
+  - Improves compatibility and reduces potential event parsing issues
+
+### Fixed
+- **Duration Lost During Navigation**: Fixed issue where duration would be temporarily lost when listeners are added after player initialization
+  - Controller now notifies all listeners with current state when duration becomes available
+  - Ensures UI components added dynamically receive accurate state information
+
+## [0.2.15] - 2025-10-31
+
+### Added
+- **Buffering State Debounce**: Added 400ms debounce to buffering state changes to prevent UI flicker
+  - Buffering state is only emitted if it persists for more than 400ms
+  - Prevents brief buffering periods from causing UI flicker
+  - Automatically restores previous play/pause state when buffering completes
+  - Tracks last non-buffering state for accurate restoration
+
+### Improved
+- **Code Quality**: Removed all `debugPrint` statements from the package
+  - Cleaner production code without debug output
+  - Better performance by avoiding unnecessary string operations
+  - Error handling now uses silent catch blocks or returns appropriate defaults
+
+### Fixed
+- **Custom Overlay Not Working After Navigation**: Fixed critical issue where custom overlays would break after using `releaseResources()`
+  - `_overlayBuilder` is now preserved across `releaseResources()` calls
+  - Native controls properly hide/show based on overlay presence after reconnection
+  - Overlay builder persists like other state (`_state`, `_url`) for quick resumption
+  - Fixes issue where controls would be completely non-functional on second visit
+  - Only cleared on final `dispose()`, not on temporary `releaseResources()`
+
+## [0.2.14] - 2025-10-31
+
+### Added
+- **Continuous Buffering State Reporting**: Buffering state is now always reported in real-time
+  - Added `isBuffering` boolean to `timeUpdate` events (sent every 500ms)
+  - Android: Tracks `player.playbackState == Player.STATE_BUFFERING`
+  - iOS: Tracks `player.timeControlStatus == .waitingToPlayAtSpecifiedRate`
+  - Flutter controller automatically transitions to `PlayerActivityState.buffering` when buffering starts
+  - Ensures UI always reflects accurate buffering status, even when video is in play state
+
+### Improved
+- **Qualities Persistence After Re-initialization**: Video qualities now persist across view recreations
+  - Added `qualitiesCache` storage to `SharedPlayerManager` on both iOS and Android
+  - Qualities are automatically cached when fetched and restored when view is recreated
+  - Eliminates the need to re-fetch qualities from network after navigation
+  - Ensures qualities are immediately available after calling `releaseResources()` and re-initializing
+
+### Fixed
+- **Buffering Not Visible During Playback**: Fixed issue where video would buffer while in play state without indicating buffering status
+  - Buffering state is now continuously tracked and reported every 500ms
+  - UI can now simultaneously show that video wants to play but is currently buffering
+  - Prevents confusion when video stalls during playback
+
+- **Missing Qualities After Navigation**: Fixed issue where video qualities would disappear after navigating away and back
+  - Qualities are now stored in `SharedPlayerManager` which survives view recreation
+  - `getAvailableQualities()` automatically restores from cache when view instance is empty
+  - Works correctly with the release/re-init pattern used when navigating
+
+## [0.2.13] - 2025-10-30
+
+### Added
+- **Overlay Lock Feature**: Added ability to lock custom overlay to always be visible
+  - New `lockOverlay()` method to keep overlay permanently visible
+  - New `unlockOverlay()` method to restore normal tap-to-hide behavior
+  - New `isOverlayLocked` getter to check current lock state
+  - New `isOverlayLockedStream` for reactive lock state updates
+  - When locked, overlay cannot be dismissed by tapping or auto-hide timer
+  - Useful for live streams, interactive content, or when constant access to controls is needed
+
+### Fixed
+- **AirPlay Connection State Updates**: Fixed issue where AirPlay connection state was not properly updating the controller state
+  - Now properly updates `_state.isAirplayConnected` when receiving `airPlayConnectionChanged` events
+  - Ensures `isAirplayConnectedStream` emits correctly when connection state changes
+  - Provides consistent state tracking between event handlers and controller state
+  
+## [0.2.12] - 2025-10-30
+
+### Added
+- **Automatic Overlay Management for PiP**: Custom overlays now automatically hide when entering PiP and show when exiting PiP on Android
+  - Prevents overlay from appearing in PiP window
+  - Seamless user experience when transitioning to/from PiP mode
+  - Only affects Android platform (iOS handles PiP differently)
+
+### Improved
+- **Enhanced Picture-in-Picture Transitions (Android)**: Major improvements to PiP mode behavior
+  - Added automatic fullscreen entry before PiP for better visual transitions
+  - Added `wasFullscreenBeforePip` tracking to restore correct state after PiP
+  - Implemented source rect hints for more accurate PiP window positioning
+  - Added seamless resize support for Android 12+ for smoother PiP transitions
+  - PiP window now correctly restores to inline or fullscreen mode based on state before PiP entry
+  - Improved visual consistency when entering and exiting PiP mode
+
+- **Shared Player Surface Reconnection**: Enhanced surface handling for shared players
+  - Added automatic surface reconnection after `releaseResources()` is called
+  - Ensures video playback resumes correctly when returning to a video with a shared player
+  - Prevents black screen issues when navigating back to previously viewed videos
+
+- **PiP Availability Detection**: Improved activity context handling for PiP feature detection
+  - Added `getActivity()` helper method to properly unwrap `ContextWrapper` instances
+  - More reliable PiP availability checks across different context types
+  - Better error handling when activity context is not immediately available
+
+### Fixed
+- **Custom Overlay in PiP Window**: Fixed issue where custom overlays would appear in the PiP window on Android
+  - Overlay is now automatically hidden before entering PiP
+  - Overlay automatically reappears when exiting PiP
+  - Provides clean PiP experience with only native system controls
+
+- **Fullscreen State After PiP**: Fixed incorrect fullscreen state restoration after exiting PiP
+  - Now properly tracks fullscreen state before entering PiP
+  - Restores to inline mode if video was inline before PiP
+  - Maintains fullscreen mode if video was fullscreen before PiP
+  - Eliminates unexpected fullscreen state changes after PiP
+
+## [0.2.11] - 2025-10-28
+
+### Fixed
+- **Progress Bar Seek Jump**: Fixed issue where progress bar would jump back briefly after seeking
+  - Added `_targetSeekPosition` to track where we're seeking to
+  - Modified seek handling to ignore old position events during seek operation
+  - Progress bar now stays at target position until native player confirms seek completion
+  - Position updates within 200ms of target are considered successful seeks
+  - Eliminates the 500ms "jump back" behavior when seeking
+
+## [0.2.10] - 2025-10-28
+
+### Added
+- **Quality List Stream**: Added `qualitiesStream` to track changes in available video qualities
+  - Stream emits `List<NativeVideoPlayerQuality>` whenever quality list changes
+  - Useful for updating UI when qualities are loaded or changed
+  - Follows the same pattern as other property streams
+  - Example usage in `custom_video_overlay.dart` demonstrates reactive quality selector updates
+
+- **Automatic Orientation Restoration**: Enhanced `FullscreenManager` with intelligent orientation tracking
+  - Automatically saves current orientation preferences when entering fullscreen
+  - Restores original orientations when exiting fullscreen (no manual setup required)
+  - Added `setPreferredOrientations()` helper method as optional drop-in replacement for `SystemChrome.setPreferredOrientations()`
+  - Added `preferredOrientations` parameter to `NativeVideoPlayerController` for easy orientation configuration
+  - Supports per-controller orientation preferences (e.g., portrait-only apps can specify this when creating the controller)
+
+- **Tap-to-Hide Overlay**: Enhanced custom overlay interaction
+  - Tapping on visible overlay now hides it (in addition to the auto-hide timer)
+  - Tapping on hidden overlay shows it (existing behavior)
+  - Interactive elements (buttons, sliders) are unaffected and work normally
+  - Uses `HitTestBehavior.deferToChild` for proper gesture handling
+
+### Fixed
+- **Stream Disposal Race Condition**: Fixed "Bad state: Cannot add new events after calling close" error
+  - Added `_isDisposed` flag to prevent state updates after disposal
+  - Added `isClosed` checks before adding events to all stream controllers
+  - Improved disposal order: now cancels event subscriptions before closing stream controllers
+  - Added double-disposal guard to prevent errors from multiple dispose calls
+  - Affects: `bufferedPositionController`, `durationController`, `playerStateController`, `positionController`, `speedController`, `isPipEnabledController`, `isPipAvailableController`, `isAirplayAvailableController`, `isAirplayConnectedController`, `isFullscreenController`, `qualityChangedController`, and `qualitiesController`
+
+### Changed
+- **Custom Video Overlay**: Refactored to use streams instead of control events
+  - Now uses `bufferedPositionStream` for reactive buffer position updates
+  - Now uses `qualitiesStream` for reactive quality list updates
+  - Reduced dependency on control event polling
+  - Improved code organization and separation of concerns
+  - Added `dart:async` import for `StreamSubscription` support
+
+### Documentation
+- Updated `NativeVideoPlayerController` documentation with `preferredOrientations` usage examples
+- Updated `FullscreenManager` documentation explaining automatic orientation tracking
+- Added comprehensive explanation of auto quality feature and buffer health thresholds
+
+## [0.2.9] - 2025-10-27
+
+### Added
+- **HDR Control**: Added `enableHDR` parameter to `NativeVideoPlayerController`
+  - Defaults to `false` to prevent washed-out/too-white video appearance on HDR content
+  - Set to `true` to enable HDR playback when desired
+  - Applies to both iOS and Android platforms
+  - ExoPlayer automatically handles tone-mapping to SDR when HDR is disabled
+
+- **AirPlay Connection State Tracking**: Enhanced AirPlay monitoring with connection state
+  - Added `isAirplayConnected` property to `NativeVideoPlayerState`
+  - Added `isAirplayConnected` getter to `NativeVideoPlayerController`
+  - Added `isAirplayConnectedStream` for real-time connection state updates
+  - New `PlayerControlState` events: `airPlayConnected` and `airPlayDisconnected`
+  - Allows UI to respond to active AirPlay streaming state
+
+- **Convenience State Getters**: Added direct property access to controller state
+  - `speed` - Current playback speed
+  - `isPipEnabled` - Current Picture-in-Picture state
+  - `isPipAvailable` - PiP device availability
+  - `isAirplayAvailable` - AirPlay device availability
+  - `isAirplayConnected` - Active AirPlay connection state
+
+### Fixed
+- **Android Picture-in-Picture Media Session**: Fixed media info not displaying correctly in PiP mode
+  - Media session now properly updates when entering PiP mode (manual, automatic, and exit)
+  - Ensures notification and lock screen controls show correct title, subtitle, and artwork
+  - Applies to all PiP entry/exit scenarios: manual start/stop and automatic transitions
+
+### Changed
+- Enhanced `NativeVideoPlayerState` model with `isAirplayConnected` property
+- Updated event handling to process AirPlay connection state changes
+- Improved Android PiP lifecycle to ensure media session consistency
+
+## [0.2.8] - 2025-10-27
+
+### Added
+- **Individual Property Streams**: Added dedicated broadcast streams for convenient property monitoring
+  - `bufferedPositionStream` - Stream of buffered position changes
+  - `durationStream` - Stream of duration changes
+  - `playerStateStream` - Stream of player state changes (playing, paused, buffering, etc.)
+  - `positionStream` - Stream of playback position changes
+  - `speedStream` - Stream of playback speed changes
+  - `isPipEnabledStream` - Stream of Picture-in-Picture state changes
+  - `isPipAvailableStream` - Stream of Picture-in-Picture availability changes
+  - `isAirplayAvailableStream` - Stream of AirPlay availability changes
+  - `isFullscreenStream` - Stream of fullscreen state changes
+  - `qualityChangedStream` - Stream of quality changes
+  - Streams only emit when values actually change (no duplicate emissions)
+  - All streams are broadcast streams allowing multiple listeners
+
+- **Toggle Picture-in-Picture**: Added `togglePictureInPicture()` method for easy PiP toggling
+  - Automatically checks current PiP state and enters/exits accordingly
+  - Returns `bool` indicating success/failure of the operation
+  - Follows the same pattern as `toggleFullScreen()` for consistency
+
+### Changed
+- **Enhanced State Model**: Extended `NativeVideoPlayerState` with new properties
+  - Added `speed` property to track playback speed
+  - Added `isPipEnabled` property to track current PiP state
+  - Added `isPipAvailable` property to track PiP device availability
+  - Added `isAirplayAvailable` property to track AirPlay device availability
+  - Updated `copyWith()`, `operator==`, and `hashCode` to include new properties
+
+- **Improved Event Handling**: Enhanced event processing to update state properties
+  - Quality changes now update state and emit to quality stream
+  - Speed changes now update state and emit to speed stream
+  - PiP state changes (both platform view and MainActivity events) now update state and emit to PiP streams
+  - PiP availability changes now update state and emit to availability stream
+  - AirPlay availability changes now update state and emit to AirPlay stream
+
+### Documentation
+- Added comprehensive documentation for individual property streams in README
+- Added usage examples showing how to use streams vs event listeners
+- Updated API Reference section with new streams and toggle method
+- Added dedicated Streams subsection in API Reference documenting all 10 available streams
+- Updated Picture-in-Picture section with `togglePictureInPicture()` usage examples
+
+### Note
+- The original event listeners (`addActivityListener`, `addControlListener`) continue to work as before
+- Users can choose between using dedicated streams or event listeners based on their use case
+- Stream controllers are properly disposed in the `dispose()` method to prevent memory leaks
+
+## [0.2.7] - 2025-10-23
+
+### Improved
+- **Enhanced Player Disposal and Cleanup**: Improved SharedPlayerManager on both iOS and Android platforms
+  - Added `stopAllViewsForController()` method to properly stop playback and clear player from all views when disposing
+  - Enhanced iOS disposal to pause player and clear current item before removing
+  - Enhanced Android disposal to stop playback and clear active views
+  - Improved logging for better debugging of player lifecycle
+  - Better cleanup of view references when controller is disposed
+
+### Changed
+- Code formatting improvements across the codebase to comply with Dart style guidelines
+- Improved readability with better line formatting in `NativeVideoPlayerController`
+
+## [0.2.6] - 2025-10-23
+
+### Fixed
+- **Critical Controller Disposal Bug**: Fixed incomplete resource cleanup in `NativeVideoPlayerController.dispose()` method
+  - Added proper cleanup of PiP event subscription (Android global listener)
+  - Added cleanup of AirPlay listeners (availability and connection handlers)
+  - Added cleanup of platform view contexts map
+  - Added cleanup of overlay builder and fullscreen callback references
+  - Fixed memory leaks by ensuring all event handlers and subscriptions are properly cancelled
+
+- **Android Player Reinitialization Issue**: Fixed critical bug where Android players could not be reinitialized after disposal
+  - Fixed `VideoPlayerMethodHandler.handleDispose()` to properly remove player from `SharedPlayerManager`
+  - Added `controllerId` parameter to `VideoPlayerMethodHandler` constructor
+  - Now properly releases ExoPlayer, notification handler, and clears PiP settings on disposal
+  - Android players can now be disposed and recreated just like iOS players
+
+### Changed
+- Enhanced `VideoPlayerMethodChannel` with new `dispose()` method that calls native platform disposal
+- Updated Flutter controller `dispose()` to call native cleanup via method channel
+- Improved disposal flow to ensure both Flutter and native resources are properly cleaned up
+
+### Documentation
+- Updated `dispose()` method documentation to reflect proper disposal of both Flutter and native platform resources
+
+## [0.2.5] - 2025-10-23
+
+### Improved
+- **Android Media Info Management**: Refactored VideoPlayerNotificationHandler and VideoPlayerObserver for improved media information management
+  - Enhanced media session and notification updates to occur consistently when playback starts
+  - Improved user experience in both normal playback and Picture-in-Picture modes
+  - Cleaned up code for better readability and maintainability
+  - Enhanced logging for better debugging capabilities
+
+## [0.2.4] - 2025-10-23
+
+### Fixed
+- **iOS Automatic Picture-in-Picture for Shared Controllers**: Fixed critical issue where automatic PiP would not work correctly when multiple views share the same controller (e.g., list view + detail view scenario)
+  - Fixed race condition where multiple views observing the same shared player would compete for PiP control
+  - Added primary view tracking to ensure only the most recently active view can trigger automatic PiP
+  - Fixed automatic PiP not working for videos started with native controls (non-programmatic playback)
+  - Improved SharedPlayerManager to properly handle PiP state transfers between views with the same controller ID
+  - Added `isPrimaryView()` and `getPrimaryViewId()` methods to prevent observer conflicts
+
+### Changed
+- Enhanced observer logic to detect when playback starts via native controls and automatically set the view as primary
+- Improved logging for debugging PiP state transitions across multiple views
+
+## [0.2.3] - 2025-10-21
+
+### Fixed
+- Fixed Dart formatting issues in `native_video_player_controller.dart` and `fullscreen_manager.dart` to comply with pub.dev static analysis requirements
+
+## [0.2.2] - 2025-10-21
+
+### Added
+- WASM compatibility: Package now supports Web Assembly (WASM) runtime
+  - Implemented conditional imports using `dart:io` only on native platforms
+  - Added `PlatformUtils` class for platform detection without direct `dart:io` dependency
+  - Exported `PlatformUtils` for users who need platform-agnostic code
+
+### Changed
+- Replaced direct `Platform` checks with `PlatformUtils` in fullscreen manager and controller
+- Code formatting improvements across all files
+
+## [0.2.1] - 2025-10-21
+
+### Fixed
+- Updated iOS podspec version to match package version (0.2.1)
+
+## [0.2.0] - 2025-10-21
+
+### Added
+- **AirPlay Support (iOS)**: Complete AirPlay integration for streaming to Apple TV and AirPlay-enabled devices
+  - `isAirPlayAvailable()` method to check for available AirPlay devices
+  - `showAirPlayPicker()` method to display native AirPlay device picker
+  - `addAirPlayAvailabilityListener()` to monitor when AirPlay devices become available/unavailable
+  - `addAirPlayConnectionListener()` to track AirPlay connection state changes
+  - Automatic detection of AirPlay-enabled devices on the network
+  - Support for streaming video to multiple AirPlay receivers
+
+- **Custom Overlay Controls**: Build your own video player UI on top of the native player
+  - New `overlayBuilder` parameter in `NativeVideoPlayer` widget
+  - Full access to controller state for custom UI implementations
+  - Allows building custom controls while maintaining native video decoding performance
+  - Example implementation in `example/lib/widgets/custom_video_overlay.dart` with:
+    - Play/pause control
+    - Progress slider with buffered position indicator
+    - Speed controls (0.25x - 2.0x)
+    - Quality selector for HLS streams
+    - Fullscreen toggle
+    - Volume control
+    - AirPlay button (iOS)
+    - Auto-hide functionality
+
+- **Dart-side Fullscreen Management**: New `FullscreenManager` class for Flutter-based fullscreen
+  - `FullscreenVideoPlayer` widget for fullscreen video playback in a Flutter overlay
+  - `enterFullscreen()` and `exitFullscreen()` methods
+  - System UI management (hide/show status bar and navigation bar)
+  - Device orientation locking options
+  - Fullscreen dialog helper for easy integration
+  - Works alongside native fullscreen for maximum flexibility
+
+- **Buffered Position Tracking**: Real-time buffered position updates
+  - New `bufferedPosition` property in controller
+  - Included in `timeUpdated` control events
+  - Enables showing how much video has been preloaded
+  - Perfect for showing secondary progress indicator in custom overlays
+
+### Improved
+- Enhanced controller state management with better activity and control state tracking
+- Improved fullscreen state synchronization between native and Dart layers
+- Better event listener management with separate activity and control listeners
+- Enhanced example app with new `video_with_overlay_screen.dart` demonstrating custom controls
+- Improved documentation with comprehensive AirPlay and custom overlay usage examples
+- Better error handling and state validation throughout the player lifecycle
+
+### Documentation
+- Updated README with comprehensive sections on AirPlay and custom overlays
+- Added example code for all new features
+
+## [0.1.4] - 2025-10-20
+
+### Fixed
+- Fixed Dart SDK constraint to use proper version range (>=3.9.0 <4.0.0) instead of exact version, allowing compatibility with all Dart 3.9.x and 3.x versions
+
+## [0.1.3] - 2025-10-20
+
+### Fixed
+- Fixed fullscreen exit handling on iOS when user dismisses by swiping down or tapping Done button
+- Fixed iOS playback state preservation when exiting fullscreen (video now resumes playing if it was playing before)
+- Fixed Android fullscreen button icon synchronization when fullscreen is toggled from Flutter code
+- Fixed fullscreen event parsing to properly distinguish between entering and exiting fullscreen states
+- Fixed shared player state synchronization by sending current playback state when new views attach
+
+### Improved
+- Standardized event naming by renaming `videoLoaded` to `loaded` across all platforms for consistency
+- Enhanced Android fullscreen button to detect and correct icon desynchronization
+- Improved shared player initial state callback mechanism to properly communicate loaded state with duration
+- Better fullscreen state event notifications on Android with proper `isFullscreen` data
+- Enhanced iOS fullscreen delegate handling with playback state restoration
+
+## [0.1.2] - 2025-01-16
+
+### Fixed
+- Fixed iOS player state tracking by observing `timeControlStatus` instead of relying only on item observers
+- Fixed shared player initialization to properly handle existing players vs new players
+- Fixed Android PiP event channel setup to only initialize on Android platform (prevents iOS errors)
+- Fixed playback state synchronization when connecting to shared players
+- Fixed unnecessary buffering/loading events for shared players during reattachment
+
+### Improved
+- Enhanced iOS player observer to distinguish between play/pause and buffering states
+- Improved shared player management with better state tracking and event handling
+- Enhanced Android player controls by hiding unnecessary buttons (next, previous, settings)
+- Better error handling and logging throughout the player lifecycle
+
+## [0.1.1] - 2025-10-20
+
+### Fixed
+- Fixed Android package name to match plugin name (com.huddlecommunity.better_native_video_player)
+- Fixed plugin registration in Android
+
+## [0.1.0] - 2025-10-20
+
+### Changed
+- Updated Flutter SDK constraint to 3.9.2
+- Updated flutter_lints to 6.0.0
+
+## [0.0.1] - 2025-01-16
+
+### Added
+- Initial release of native_video_player plugin
+- Native video playback using AVPlayerViewController (iOS) and ExoPlayer/Media3 (Android)
+- HLS streaming support with adaptive quality selection
+- Picture-in-Picture (PiP) mode on both platforms
+- Native fullscreen playback
+- Now Playing integration (Control Center on iOS, lock screen on Android)
+- Background playback with media notifications
+- Comprehensive playback controls:
+  - Play/pause
+  - Seek to position
+  - Volume control
+  - Playback speed adjustment (0.5x to 2.0x)
+  - Quality selection for HLS streams
+- Event streaming for player state changes
+- Support for custom media info (title, subtitle, album, artwork)
+- Configurable PiP behavior
+- Native player controls toggle
+- Example app demonstrating all features
+- Comprehensive documentation and API reference
+
+### Platform Support
+- iOS 12.0+
+- Android API 24+ (Android 7.0+)
+
+### Dependencies
+- Flutter SDK ^3.9.2
+- iOS: AVFoundation framework
+- Android: androidx.media3 1.5.0 (ExoPlayer, HLS, Session)
+
+[0.0.1]: https://github.com/DaniKemper010/native-video-player/releases/tag/v0.0.1

@@ -1,0 +1,2926 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:floating/floating.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../config/native_video_player_config.dart';
+import '../advertising/native_video_player_ad_configuration.dart';
+import '../advertising/native_video_player_ad_event.dart';
+import '../advertising/native_video_player_ad_platform.dart';
+import '../enums/native_video_player_event.dart';
+import '../fullscreen/fullscreen_manager.dart';
+import '../fullscreen/fullscreen_video_player.dart';
+import '../models/native_video_player_audio_track.dart';
+import '../models/native_video_player_media_info.dart';
+import '../models/native_video_player_playback_range.dart';
+import '../models/native_video_player_quality.dart';
+import '../models/native_video_player_sidecar_subtitle.dart';
+import '../models/native_video_player_state.dart';
+import '../models/native_video_player_subtitle_style.dart';
+import '../models/native_video_player_subtitle_track.dart';
+import '../models/native_video_player_video_size.dart';
+import '../platform/platform_utils.dart';
+import '../platform/video_player_method_channel.dart';
+import '../services/airplay_state_manager.dart';
+import '../services/playback_coordinator.dart';
+import '../subtitles/sidecar_subtitle_engine.dart';
+
+part 'native_video_player_controller_events.dart';
+part 'native_video_player_controller_advertising.dart';
+
+/// Controller for managing native video player via platform channels
+///
+/// This controller bridges Flutter and native AVPlayerViewController using
+/// MethodChannel for commands and EventChannel for state updates.
+///
+/// **Usage:**
+/// ```dart
+/// final controller = NativeVideoPlayerController(
+///   id: videoId,
+///   autoPlay: true,
+///   preferredOrientations: [DeviceOrientation.portraitUp], // Optional
+/// );
+/// await controller.load(url: 'https://example.com/video.m3u8');
+/// ```
+///
+/// **Orientation Control:**
+/// The `preferredOrientations` parameter allows you to specify which device
+/// orientations are allowed in your app. When exiting fullscreen, the player
+/// will automatically restore these orientations. If not specified, all
+/// orientations are allowed by default.
+///
+/// **Platform Communication:**
+/// - MethodChannel: Flutter → Native (play, pause, seek, etc.)
+/// - EventChannel: Native → Flutter (state changes, errors, buffering)
+class NativeVideoPlayerController {
+  NativeVideoPlayerController({
+    required this.id,
+    this.autoPlay = false,
+    this.mediaInfo,
+    this.allowsPictureInPicture = true,
+    this.canStartPictureInPictureAutomatically = true,
+    this.lockToLandscape = true,
+    this.enableHDR = true,
+    this.enableLooping = false,
+    this.showNativeControls = true,
+    this.preventFullscreenSwipeDismiss = true,
+    List<DeviceOrientation>? preferredOrientations,
+  }) {
+    // Set preferred orientations if provided
+    if (preferredOrientations != null) {
+      FullscreenManager.setPreferredOrientations(preferredOrientations);
+    }
+
+    // Set up app lifecycle listener for Android to hide overlay before PiP
+    if (!kIsWeb && Platform.isAndroid) {
+      WidgetsBinding.instance.addObserver(_AppLifecycleObserver(this));
+    }
+
+    // Set up controller-level event channel for persistent events (PiP, AirPlay)
+    _controllerChannelSetupFuture = _setupControllerEventChannel();
+  }
+
+  /// Initialize the controller and wait for the platform view to be created
+  Future<void> initialize() async {
+    if (_isInitialized) {
+      return;
+    }
+
+    // If already initializing, wait for the existing initialization to complete
+    if (_isInitializing && _initializeCompleter != null) {
+      await _initializeCompleter!.future;
+      return;
+    }
+
+    // If platform view is already created and method channel exists, mark as initialized immediately
+    if (_methodChannel != null && _platformViewIds.isNotEmpty) {
+      _isInitialized = true;
+      _updateState(
+        _state.copyWith(activityState: PlayerActivityState.initialized),
+      );
+      return;
+    }
+
+    // Mark as initializing
+    _isInitializing = true;
+
+    // Set state to initializing immediately
+    _updateState(
+      _state.copyWith(activityState: PlayerActivityState.initializing),
+    );
+
+    // Create a completer that will be completed when the platform view is created
+    _initializeCompleter = Completer<void>();
+
+    // Wait for the platform view to be created
+    await _initializeCompleter!.future;
+
+    // Mark as initialized
+    _isInitialized = true;
+    _isInitializing = false;
+
+    _updateState(
+      _state.copyWith(activityState: PlayerActivityState.initialized),
+    );
+  }
+
+  /// Unique identifier for this video player instance
+  final int id;
+
+  /// Whether to start playing automatically when initialized
+  final bool autoPlay;
+
+  /// Whether to lock orientation to landscape in fullscreen mode
+  final bool lockToLandscape;
+
+  /// Optional media information (title, subtitle, artwork) for Now Playing display
+  final NativeVideoPlayerMediaInfo? mediaInfo;
+
+  /// Whether Picture-in-Picture mode is allowed
+  final bool allowsPictureInPicture;
+
+  /// Whether PiP can start automatically when app goes to background (iOS 14.2+)
+  final bool canStartPictureInPictureAutomatically;
+
+  /// Whether to enable HDR playback (default: false)
+  /// When set to false, HDR is disabled to prevent washed-out/too-white video appearance
+  final bool enableHDR;
+
+  /// Whether to enable video looping (default: false)
+  /// When set to true, the video will automatically restart from the beginning when it reaches the end
+  final bool enableLooping;
+
+  /// Whether to show native player controls (default: true)
+  /// When set to false, native controls are hidden. Custom overlays automatically hide native controls regardless of this setting.
+  final bool showNativeControls;
+
+  /// Whether swipe/pinch gestures are disabled in native iOS fullscreen
+  /// (default: true)
+  ///
+  /// AVPlayerViewController's internal swipe-to-dismiss gesture can leave the
+  /// inline player with a black screen; with this enabled, fullscreen can only
+  /// be exited via the Done button. Set to false to restore the system swipe
+  /// gesture. Has no effect on Android or on Dart-side (custom overlay)
+  /// fullscreen.
+  final bool preventFullscreenSwipeDismiss;
+
+  /// BuildContext getter for showing Dart fullscreen dialog
+  /// Returns a mounted context from any registered platform view
+  BuildContext? get _fullscreenContext {
+    // Try to find a mounted context from the registered platform views
+    for (final viewId in _platformViewIds) {
+      // We'll need to track contexts per platform view
+      final ctx = _platformViewContexts[viewId];
+      if (ctx != null && ctx.mounted) {
+        return ctx;
+      }
+    }
+    return null;
+  }
+
+  /// Map of platform view IDs to their contexts
+  final Map<int, BuildContext> _platformViewContexts = <int, BuildContext>{};
+
+  /// Overlay builder to use in fullscreen mode
+  /// This is passed from NativeVideoPlayer widget
+  Widget Function(BuildContext, NativeVideoPlayerController)? _overlayBuilder;
+
+  /// Sidecar subtitle style to use in fullscreen mode
+  /// This is passed from the NativeVideoPlayer widget so the Dart fullscreen
+  /// host renders captions identically to the inline player.
+  NativeVideoPlayerSubtitleStyle? _subtitleStyle;
+
+  /// Text-size scale for embedded (native-rendered) subtitle tracks.
+  /// Cached so it can be re-applied when the native view is recreated
+  /// (list→detail→back) or a new item is loaded. Issue #43.
+  double _embeddedTextScale = 1.0;
+
+  /// Callback to close the Dart fullscreen dialog
+  /// Set by FullscreenVideoPlayer when it's created
+  VoidCallback? _dartFullscreenCloseCallback;
+
+  /// Whether the overlay visibility is locked (cannot be dismissed)
+  bool _isOverlayLocked = false;
+
+  /// Whether the overlay should be hidden during PiP transition
+  /// This is set when Android requests fullscreen for PiP preparation
+  bool _hideOverlayForPip = false;
+
+  /// Whether we have a custom overlay (determines if we use Dart fullscreen and hide native controls)
+  bool get _hasCustomOverlay => _overlayBuilder != null && !_hideOverlayForPip;
+
+  /// Returns whether the overlay is currently locked (always visible)
+  bool get isOverlayLocked => _isOverlayLocked;
+
+  /// Stream controller for overlay lock state changes
+  final StreamController<bool> _isOverlayLockedController =
+      StreamController<bool>.broadcast();
+
+  /// Stream of overlay lock state changes
+  Stream<bool> get isOverlayLockedStream => _isOverlayLockedController.stream;
+
+  /// Current state of the video player
+  NativeVideoPlayerState _state = const NativeVideoPlayerState();
+
+  /// Video URL set when load() is called
+  String? _url;
+
+  /// Set when the native side evicted this controller's player under the iOS
+  /// total-player LRU cap ([NativeVideoPlayerConfig.iosMaxTotalPlayers]). The
+  /// next [play] transparently re-loads the last source at
+  /// [_evictionResumePosition] instead of no-oping against the torn-down
+  /// player (see [_reloadEvictedSource]).
+  bool _needsReloadAfterEviction = false;
+
+  /// Playback position captured natively just before eviction; restored by
+  /// the eviction re-load.
+  Duration _evictionResumePosition = Duration.zero;
+
+  /// Headers and DRM config of the last [load] call, retained so an eviction
+  /// re-load can replay the same request.
+  Map<String, String>? _lastLoadHeaders;
+  Map<String, dynamic>? _lastLoadDrmConfig;
+
+  /// Optional advertising contract retained with the content request. This
+  /// lets the existing iOS eviction recovery replay the same future ad setup
+  /// rather than silently changing an ad-configured load into a content-only
+  /// load.
+  NativeVideoPlayerAdConfiguration? _lastAdConfiguration;
+
+  final Set<String> _triggeredMidRollBreakIds = <String>{};
+  NativeVideoPlayerAdBreak? _activeMidRollBreak;
+  Duration? _midRollResumePosition;
+  bool _midRollRequestInFlight = false;
+  bool _postRollTriggered = false;
+  bool _postRollRequestInFlight = false;
+
+  /// Method channel wrapper for platform communication
+  VideoPlayerMethodChannel? _methodChannel;
+
+  /// Floating instance for Android PiP management
+  final Floating _floating = Floating();
+
+  /// Set of platform view IDs that are using this controller
+  final Set<int> _platformViewIds = <int>{};
+
+  /// Primary platform view ID (most recent one registered)
+  int? _primaryPlatformViewId;
+
+  /// Updates the method channel to use the specified platform view ID
+  void _updateMethodChannel(int platformViewId) {
+    // Unregister old method channel from AirPlay manager
+    if (_methodChannel != null) {
+      AirPlayStateManager.instance.unregisterMethodChannel(_methodChannel!);
+    }
+
+    _primaryPlatformViewId = platformViewId;
+    _methodChannel = VideoPlayerMethodChannel(
+      primaryPlatformViewId: platformViewId,
+    );
+    advertisementController._attachPlatform(_methodChannel!);
+
+    // Register new method channel with AirPlay manager
+    AirPlayStateManager.instance.registerMethodChannel(_methodChannel!);
+  }
+
+  /// Completer to wait for initialization to complete
+  Completer<void>? _initializeCompleter;
+
+  /// Flag to track if the controller has been initialized
+  bool _isInitialized = false;
+
+  /// Flag to track if initialization is currently in progress
+  bool _isInitializing = false;
+
+  /// Flag to track if the controller has been disposed
+  bool _isDisposed = false;
+
+  /// Event channel subscriptions for each platform view
+  final Map<int, StreamSubscription<dynamic>> _eventSubscriptions =
+      <int, StreamSubscription<dynamic>>{};
+
+  /// MainActivity PiP event channel subscription (Android only).
+  ///
+  /// Always null: the native `native_video_player_pip_events` channel was
+  /// never implemented and its dead Dart-side listener has been removed. The
+  /// field and getter are kept only because the getter is public API.
+  StreamSubscription<dynamic>? _pipEventSubscription;
+
+  /// MainActivity PiP event channel subscription (Android only)
+  StreamSubscription<dynamic>? get pipEventSubscription =>
+      _pipEventSubscription;
+
+  /// Controller-level event channel (persistent, independent of platform views)
+  EventChannel? _controllerEventChannel;
+
+  /// Controller-level event subscription (for PiP and AirPlay events)
+  StreamSubscription<dynamic>? _controllerEventSubscription;
+
+  /// The shared plugin method channel, available from plugin registration
+  /// (before any platform view exists). Used for controller-scoped calls
+  /// that don't go through a per-view method channel.
+  static const MethodChannel _pluginMethodChannel = MethodChannel(
+    'native_video_player',
+  );
+
+  /// Delays between retries when asking the native side to register the
+  /// controller event channel handler. The plugin may not be attached yet
+  /// during a cold start or right after a hot restart.
+  @visibleForTesting
+  static List<Duration> controllerChannelRetryDelays = const [
+    Duration(milliseconds: 50),
+    Duration(milliseconds: 200),
+    Duration(seconds: 1),
+  ];
+
+  /// Completes when the constructor's controller-channel setup attempt has
+  /// finished (whether or not it succeeded).
+  Future<void>? _controllerChannelSetupFuture;
+
+  /// The in-flight controller-channel setup, exposed for tests.
+  @visibleForTesting
+  Future<void>? get debugControllerChannelSetup =>
+      _controllerChannelSetupFuture;
+
+  @visibleForTesting
+  void debugUpdatePlaybackState({
+    required Duration position,
+    required PlayerActivityState activityState,
+  }) {
+    _updateState(
+      _state.copyWith(
+        currentPosition: position,
+        activityState: activityState,
+      ),
+    );
+  }
+
+  @visibleForTesting
+  void debugHandleControllerEvent(Map<dynamic, dynamic> eventMap) {
+    _handleControllerEvent(eventMap);
+  }
+
+  /// Adapter through which the [PlaybackCoordinator] sees this controller
+  /// (cap enforcement for [NativeVideoPlayerConfig.maxConcurrentPlayingPlayers]).
+  late final PlayableHandle _playableHandle = _ControllerPlayableHandle(this);
+
+  /// Engine for sidecar (external VTT/SRT) subtitles: loads, parses and
+  /// time-syncs cues for the Flutter subtitle overlay. Survives
+  /// releaseResources() (sources/cues persist for reattachment); disposed
+  /// with the controller.
+  final SidecarSubtitleEngine _sidecarSubtitles = SidecarSubtitleEngine();
+
+  /// Optional in-stream advertising state for the current content load.
+  ///
+  /// Without an [NativeVideoPlayerAdConfiguration] passed to [load], this
+  /// remains disabled and does not affect content playback.
+  final NativeVideoPlayerAdvertisementController advertisementController =
+      NativeVideoPlayerAdvertisementController();
+
+  /// Active sidecar subtitle cue lines at the current playback position.
+  /// The [NativeVideoPlayer] widget's subtitle overlay listens to this;
+  /// custom overlays can too.
+  ValueListenable<List<String>> get activeSidecarCueLines =>
+      _sidecarSubtitles.activeCueLines;
+
+  /// Whether a sidecar subtitle track is currently selected.
+  bool get hasSidecarSubtitleSelected =>
+      _sidecarSubtitles.selectedSource != null;
+
+  /// Timer for buffering state debounce (400ms)
+  Timer? _bufferingDebounceTimer;
+
+  /// Watchdog bounding how long the player may sit in a load-pipeline state
+  /// (initializing/loading). A stalled native pipeline emits no event at all
+  /// — Android's ExoPlayer listener only reports STATE_READY ('loaded') or
+  /// onPlayerError ('error') — so without this the Dart state stays loading
+  /// forever and the UI shows an infinite spinner. Configured via
+  /// [NativeVideoPlayerConfig.loadTimeout]; on expiry the stall is surfaced
+  /// as a regular error event (see [_onWatchdogExpired]).
+  Timer? _loadWatchdogTimer;
+
+  /// Watchdog bounding how long the player may stay buffering. Opt-in via
+  /// [NativeVideoPlayerConfig.bufferingTimeout] (null = disabled, the
+  /// default); same expiry behavior as [_loadWatchdogTimer].
+  Timer? _bufferingWatchdogTimer;
+
+  /// Polls Android PiP state while fullscreen. Android has no native PiP
+  /// enter/exit callback (unlike iOS), and the floating package's status
+  /// stream leaks a 10ms timer it never cancels — so we poll the cheap
+  /// one-shot status ourselves to keep [isPipEnabled] accurate.
+  Timer? _androidPipPollTimer;
+
+  /// Track if we're currently in a buffering state (from native)
+  bool _isCurrentlyBuffering = false;
+
+  /// Track the last non-buffering activity state to restore after buffering
+  PlayerActivityState? _lastNonBufferingState;
+
+  /// Activity event handlers (play, pause, buffering, etc.)
+  final List<void Function(PlayerActivityEvent)> _activityEventHandlers =
+      <void Function(PlayerActivityEvent)>[];
+
+  /// Control event handlers (quality, speed, pip, fullscreen, etc.)
+  final List<void Function(PlayerControlEvent)> _controlEventHandlers =
+      <void Function(PlayerControlEvent)>[];
+
+  /// Stream controllers for individual property streams
+  final StreamController<Duration> _bufferedPositionController =
+      StreamController<Duration>.broadcast();
+  final StreamController<Duration> _durationController =
+      StreamController<Duration>.broadcast();
+  final StreamController<PlayerActivityState> _playerStateController =
+      StreamController<PlayerActivityState>.broadcast();
+  final StreamController<Duration> _positionController =
+      StreamController<Duration>.broadcast();
+  final StreamController<double> _speedController =
+      StreamController<double>.broadcast();
+  final StreamController<bool> _isPipEnabledController =
+      StreamController<bool>.broadcast();
+  final StreamController<bool> _isPipAvailableController =
+      StreamController<bool>.broadcast();
+
+  /// Latest native video dimensions (texture-rendered views report these so
+  /// the widget can letterbox the texture; platform views handle aspect
+  /// natively and may never emit one).
+  NativeVideoPlayerVideoSize? _videoSize;
+  final StreamController<NativeVideoPlayerVideoSize> _videoSizeController =
+      StreamController<NativeVideoPlayerVideoSize>.broadcast();
+
+  /// Platform-view IDs that are actually texture-rendered backends (no
+  /// Android/iOS view exists for them). Drives the Dart-fullscreen fallback.
+  final Set<int> _textureViewIds = <int>{};
+
+  /// Whether the active fullscreen session went through the Dart path (so
+  /// exit uses the matching path even without a custom overlay).
+  bool _usedDartFullscreen = false;
+
+  /// Internal: asks the mounted widget to swap a texture-rendered tile to a
+  /// platform view (iOS manual-PiP path — PiP needs an on-screen
+  /// AVPlayerLayer). The widget completes the completer once the platform
+  /// view took over and the texture half is disposed.
+  final StreamController<Completer<bool>> _surfaceSwapRequests =
+      StreamController<Completer<bool>>.broadcast();
+
+  /// Internal: listened to by [NativeVideoPlayer] widgets in texture mode.
+  Stream<Completer<bool>> get surfaceSwapRequests =>
+      _surfaceSwapRequests.stream;
+
+  Future<bool> _requestSurfaceSwap() async {
+    if (!_surfaceSwapRequests.hasListener) {
+      debugPrint('Surface swap requested but no widget is listening');
+      return false;
+    }
+    final completer = Completer<bool>();
+    _surfaceSwapRequests.add(completer);
+    try {
+      return await completer.future.timeout(const Duration(seconds: 3));
+    } on TimeoutException {
+      debugPrint('Surface swap timed out');
+      return false;
+    }
+  }
+
+  final StreamController<bool> _isFullscreenController =
+      StreamController<bool>.broadcast();
+  final StreamController<NativeVideoPlayerQuality> _qualityChangedController =
+      StreamController<NativeVideoPlayerQuality>.broadcast();
+  final StreamController<List<NativeVideoPlayerQuality>> _qualitiesController =
+      StreamController<List<NativeVideoPlayerQuality>>.broadcast();
+
+  /// Updates the internal state
+  void _updateState(NativeVideoPlayerState newState) {
+    final oldState = _state;
+    _state = newState;
+
+    // Don't emit events if the controller is disposed
+    if (_isDisposed) {
+      return;
+    }
+
+    // The content state remains the authoritative playback state. The
+    // optional ad controller only mirrors it into its orchestration session
+    // while no accepted ad transition is active.
+    advertisementController._handleContentActivityStateChanged(
+      newState.activityState,
+    );
+
+    // Emit to individual streams when values change
+    if (oldState.bufferedPosition != newState.bufferedPosition) {
+      if (!_bufferedPositionController.isClosed) {
+        _bufferedPositionController.add(newState.bufferedPosition);
+      }
+    }
+    if (oldState.duration != newState.duration) {
+      if (!_durationController.isClosed) {
+        _durationController.add(newState.duration);
+      }
+
+      // When duration changes from 0 to non-zero, notify all listeners with current state
+      // This ensures listeners added before duration was available receive the state
+      if (oldState.duration == Duration.zero &&
+          newState.duration != Duration.zero) {
+        // Notify all control listeners with time update event
+        if (_controlEventHandlers.isNotEmpty) {
+          final currentControlEvent = PlayerControlEvent(
+            state: PlayerControlState.timeUpdated,
+            data: {
+              'position': newState.currentPosition.inMilliseconds,
+              'duration': newState.duration.inMilliseconds,
+              'bufferedPosition': newState.bufferedPosition.inMilliseconds,
+              'isBuffering':
+                  newState.activityState == PlayerActivityState.buffering,
+            },
+          );
+          for (final handler in _controlEventHandlers) {
+            handler(currentControlEvent);
+          }
+        }
+
+        // Also notify activity listeners
+        if (_activityEventHandlers.isNotEmpty) {
+          final currentActivityEvent = PlayerActivityEvent(
+            state: newState.activityState,
+            data: null,
+          );
+          for (final handler in _activityEventHandlers) {
+            handler(currentActivityEvent);
+          }
+        }
+      }
+    }
+    if (oldState.activityState != newState.activityState) {
+      if (!_playerStateController.isClosed) {
+        _playerStateController.add(newState.activityState);
+      }
+
+      // Report playing-state TRANSITIONS to the playback coordinator (cap
+      // enforcement). Transitions — not play() calls — also catch playback
+      // started natively (native controls, remote commands, autoplay).
+      final bool wasPlaying =
+          oldState.activityState == PlayerActivityState.playing;
+      final bool isPlaying =
+          newState.activityState == PlayerActivityState.playing;
+      if (!wasPlaying && isPlaying) {
+        PlaybackCoordinator.instance.onPlaying(_playableHandle);
+      } else if (wasPlaying && !isPlaying) {
+        PlaybackCoordinator.instance.onStoppedPlaying(_playableHandle);
+      }
+      if (wasPlaying != isPlaying) {
+        _sidecarSubtitles.onPlayingChanged(isPlaying);
+      }
+
+      // Re-evaluate the stalled-playback watchdogs on every activity-state
+      // transition: arm while spinning up / buffering, disarm on any state
+      // that proves the pipeline made progress.
+      _updateWatchdogs(newState.activityState);
+      if (newState.activityState == PlayerActivityState.completed) {
+        unawaited(_maybeTriggerPostRoll());
+      }
+    }
+    // Hand sidecar caption rendering to the native SubtitleView while the
+    // Flutter overlay is invisible (Android PiP / native fullscreen) and
+    // take it back when inline again.
+    if (oldState.isPipEnabled != newState.isPipEnabled ||
+        oldState.isFullScreen != newState.isFullScreen) {
+      _syncNativeSidecarCaptions(newState);
+    }
+    if (oldState.isFullScreen != newState.isFullScreen) {
+      // Start/stop polling Android PiP state (PiP is only reachable from
+      // fullscreen on Android).
+      _updateAndroidPipPolling(newState);
+    }
+    if (oldState.currentPosition != newState.currentPosition) {
+      if (!_positionController.isClosed) {
+        _positionController.add(newState.currentPosition);
+      }
+      // Re-anchor the sidecar subtitle engine's cue timing.
+      _sidecarSubtitles.onPosition(newState.currentPosition);
+      _enforcePlaybackRange(newState.currentPosition);
+      unawaited(_maybeTriggerMidRoll(newState));
+    }
+    if (oldState.speed != newState.speed) {
+      if (!_speedController.isClosed) {
+        _speedController.add(newState.speed);
+      }
+      _sidecarSubtitles.onSpeedChanged(newState.speed);
+    }
+    if (oldState.isPipEnabled != newState.isPipEnabled) {
+      // Suppress oversized native captions while in Android PiP; restore on exit.
+      _suppressSubtitlesForPip(newState.isPipEnabled);
+      if (!_isPipEnabledController.isClosed) {
+        _isPipEnabledController.add(newState.isPipEnabled);
+      }
+    }
+    if (oldState.isPipAvailable != newState.isPipAvailable) {
+      if (!_isPipAvailableController.isClosed) {
+        _isPipAvailableController.add(newState.isPipAvailable);
+      }
+    }
+    // Note: AirPlay state changes are now handled by the global AirPlayStateManager
+    // The streams are provided by the manager, not by individual controllers
+    if (oldState.isFullScreen != newState.isFullScreen) {
+      if (!_isFullscreenController.isClosed) {
+        _isFullscreenController.add(newState.isFullScreen);
+      }
+    }
+    if (oldState.qualities != newState.qualities) {
+      if (!_qualitiesController.isClosed) {
+        _qualitiesController.add(newState.qualities);
+      }
+    }
+  }
+
+  /// Handles buffering state changes with 400ms debounce
+  ///
+  /// Only emits buffering state if it persists for more than 400ms.
+  /// This prevents flickering for brief buffering periods.
+  void _handleBufferingStateChange(bool isBuffering) {
+    // Track the native buffering state
+    _isCurrentlyBuffering = isBuffering;
+
+    if (isBuffering) {
+      // Store the current non-buffering state before transitioning to buffering
+      if (_state.activityState != PlayerActivityState.buffering) {
+        _lastNonBufferingState = _state.activityState;
+      }
+
+      // Cancel any existing timer
+      _bufferingDebounceTimer?.cancel();
+
+      // Start a 400ms timer - only emit buffering state if still buffering after 400ms
+      _bufferingDebounceTimer = Timer(const Duration(milliseconds: 400), () {
+        // Check if we're still buffering after 400ms
+        if (_isCurrentlyBuffering &&
+            _state.activityState != PlayerActivityState.buffering) {
+          // Update to buffering state
+          _updateState(
+            _state.copyWith(activityState: PlayerActivityState.buffering),
+          );
+        }
+      });
+    } else {
+      // Buffering stopped - cancel the timer and restore previous state
+      _bufferingDebounceTimer?.cancel();
+
+      // If we were showing buffering state, restore the previous state
+      if (_state.activityState == PlayerActivityState.buffering) {
+        // Restore the last non-buffering state
+        final restoredState =
+            _lastNonBufferingState ?? PlayerActivityState.playing;
+        _updateState(_state.copyWith(activityState: restoredState));
+      }
+    }
+  }
+
+  /// Arms/disarms the stalled-playback watchdogs for [state].
+  ///
+  /// Called on every activity-state transition:
+  /// - The load watchdog is (re-)armed while the pipeline is spinning up
+  ///   (initializing/loading) and cancelled on every other state — reaching
+  ///   initialized/loaded/playing/paused/buffering/completed/stopped, a real
+  ///   native error, or idle all prove the pipeline responded.
+  /// - The buffering watchdog is armed on buffering (only when
+  ///   [NativeVideoPlayerConfig.bufferingTimeout] is set) and cancelled on
+  ///   any other state.
+  ///
+  /// Re-entering an armed state restarts its timer, so each stage of a
+  /// multi-step spin-up (initializing → loading) gets a fresh budget.
+  void _updateWatchdogs(PlayerActivityState state) {
+    _loadWatchdogTimer?.cancel();
+    _loadWatchdogTimer = null;
+    final Duration? loadTimeout = NativeVideoPlayerConfig.global.loadTimeout;
+    if (loadTimeout != null &&
+        (state == PlayerActivityState.initializing ||
+            state == PlayerActivityState.loading)) {
+      _loadWatchdogTimer = Timer(
+        loadTimeout,
+        () => _onWatchdogExpired(loadTimeout, isBufferingWatchdog: false),
+      );
+    }
+
+    _bufferingWatchdogTimer?.cancel();
+    _bufferingWatchdogTimer = null;
+    final Duration? bufferingTimeout =
+        NativeVideoPlayerConfig.global.bufferingTimeout;
+    if (bufferingTimeout != null && state == PlayerActivityState.buffering) {
+      _bufferingWatchdogTimer = Timer(
+        bufferingTimeout,
+        () => _onWatchdogExpired(bufferingTimeout, isBufferingWatchdog: true),
+      );
+    }
+  }
+
+  /// Cancels both stalled-playback watchdogs (release/dispose paths).
+  void _cancelWatchdogs() {
+    _loadWatchdogTimer?.cancel();
+    _loadWatchdogTimer = null;
+    _bufferingWatchdogTimer?.cancel();
+    _bufferingWatchdogTimer = null;
+  }
+
+  /// Fires when a stalled-playback watchdog expires: surfaces the stall as a
+  /// regular player error.
+  ///
+  /// Synthesizes the exact event shape a real native error produces — the
+  /// native sides emit `{'event': 'error', 'message': ...}` which the event
+  /// channel listener turns into a [PlayerActivityEvent] with
+  /// [PlayerActivityState.error], updates the state, and hands to the
+  /// activity listeners — so app listeners can't tell a timeout apart from
+  /// any other playback failure. Afterwards the pipeline is best-effort
+  /// paused to stop a wedged decoder/network stack from spinning.
+  void _onWatchdogExpired(
+    Duration timeout, {
+    required bool isBufferingWatchdog,
+  }) {
+    if (_isDisposed) {
+      return;
+    }
+
+    // A state transition would have cancelled the timer, but guard against
+    // a fire that raced the cancel.
+    final PlayerActivityState current = _state.activityState;
+    final bool stillStalled = isBufferingWatchdog
+        ? current == PlayerActivityState.buffering
+        : current == PlayerActivityState.initializing ||
+              current == PlayerActivityState.loading;
+    if (!stillStalled) {
+      return;
+    }
+
+    final String timeoutLabel = timeout.inSeconds >= 1
+        ? '${timeout.inSeconds}s'
+        : '${timeout.inMilliseconds}ms';
+    final String message = isBufferingWatchdog
+        ? 'Buffering timed out after $timeoutLabel'
+        : 'Load timed out after $timeoutLabel';
+    debugPrint('Stalled-playback watchdog fired for controller $id: $message');
+
+    // Same wire shape as a native error event, parsed by the same factory.
+    final activityEvent = PlayerActivityEvent.fromMap(<dynamic, dynamic>{
+      'event': 'error',
+      'message': message,
+    });
+
+    _updateState(_state.copyWith(activityState: activityEvent.state));
+
+    for (final handler in _activityEventHandlers) {
+      handler(activityEvent);
+    }
+
+    // Best-effort quiesce; no-ops when no platform view provides a method
+    // channel yet (e.g. a stall during initialize()).
+    unawaited(
+      pause().catchError((Object e) {
+        debugPrint('Watchdog pause failed for controller $id: $e');
+      }),
+    );
+  }
+
+  /// Emits the current state to all streams
+  ///
+  /// This is useful when reconnecting after releaseResources() to ensure
+  /// new listeners receive the current state even though it hasn't changed.
+  void _emitCurrentState() {
+    if (_isDisposed) {
+      return;
+    }
+
+    if (!_bufferedPositionController.isClosed) {
+      _bufferedPositionController.add(_state.bufferedPosition);
+    }
+    if (!_durationController.isClosed) {
+      _durationController.add(_state.duration);
+    }
+    if (!_playerStateController.isClosed) {
+      _playerStateController.add(_state.activityState);
+    }
+    if (!_positionController.isClosed) {
+      _positionController.add(_state.currentPosition);
+    }
+    if (!_speedController.isClosed) {
+      _speedController.add(_state.speed);
+    }
+    if (!_isPipEnabledController.isClosed) {
+      _isPipEnabledController.add(_state.isPipEnabled);
+    }
+    if (!_isPipAvailableController.isClosed) {
+      _isPipAvailableController.add(_state.isPipAvailable);
+    }
+    // Note: AirPlay state is now managed globally by AirPlayStateManager
+    if (!_isFullscreenController.isClosed) {
+      _isFullscreenController.add(_state.isFullScreen);
+    }
+    if (!_qualitiesController.isClosed && _state.qualities.isNotEmpty) {
+      _qualitiesController.add(_state.qualities);
+    }
+  }
+
+  /// Emits the current state to all listeners
+  ///
+  /// This method broadcasts the current player state to all registered listeners:
+  /// - All stream controllers (position, duration, buffered position, etc.)
+  /// - Activity event handlers
+  /// - Control event handlers
+  /// - AirPlay availability handlers
+  /// - AirPlay connection handlers
+  /// - Overlay lock state listeners
+  ///
+  /// This is useful when you need to ensure all listeners are updated with
+  /// the current state, for example after dynamically adding new listeners
+  /// or when synchronizing external UI components.
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// // Ensure all listeners receive the current state
+  /// controller.emitCurrentStateToAllListeners();
+  /// ```
+  void emitCurrentStateToAllListeners() {
+    if (_isDisposed) {
+      return;
+    }
+
+    // Emit to all stream controllers
+    _emitCurrentState();
+
+    // Emit to activity event handlers
+    if (_activityEventHandlers.isNotEmpty) {
+      final activityEvent = PlayerActivityEvent(
+        state: _state.activityState,
+        data: null,
+      );
+      for (final handler in _activityEventHandlers) {
+        handler(activityEvent);
+      }
+    }
+
+    // Emit to control event handlers with time update event
+    if (_controlEventHandlers.isNotEmpty) {
+      final controlEvent = PlayerControlEvent(
+        state: PlayerControlState.timeUpdated,
+        data: {
+          'position': _state.currentPosition.inMilliseconds,
+          'duration': _state.duration.inMilliseconds,
+          'bufferedPosition': _state.bufferedPosition.inMilliseconds,
+          'isBuffering': _state.activityState == PlayerActivityState.buffering,
+        },
+      );
+      for (final handler in _controlEventHandlers) {
+        handler(controlEvent);
+      }
+
+      // Also emit quality information if available
+      if (_state.qualities.isNotEmpty) {
+        final qualityEvent = PlayerControlEvent(
+          state: PlayerControlState.qualityChanged,
+          data: {
+            'qualities': _state.qualities.map((q) => q.toMap()).toList(),
+            'quality': _state.qualities.first.toMap(),
+          },
+        );
+        for (final handler in _controlEventHandlers) {
+          handler(qualityEvent);
+        }
+      }
+
+      // Emit current control state if not none
+      if (_state.controlState != PlayerControlState.none) {
+        final currentStateEvent = PlayerControlEvent(
+          state: _state.controlState,
+          data: null,
+        );
+        for (final handler in _controlEventHandlers) {
+          handler(currentStateEvent);
+        }
+      }
+    }
+
+    // Emit to AirPlay availability handlers
+    for (final handler in _airPlayAvailabilityHandlers) {
+      handler(_state.isAirplayAvailable);
+    }
+
+    // Emit to AirPlay connection handlers
+    for (final handler in _airPlayConnectionHandlers) {
+      handler(_state.isAirplayConnected);
+    }
+
+    // Emit to overlay lock state listeners
+    if (!_isOverlayLockedController.isClosed) {
+      _isOverlayLockedController.add(_isOverlayLocked);
+    }
+  }
+
+  /// Refreshes availability flags and qualities from the native player
+  ///
+  /// Called when reconnecting after releaseResources() to ensure
+  /// flags like PiP available, AirPlay available, and qualities are up to date
+  Future<void> _refreshAvailabilityFlags() async {
+    if (_methodChannel == null || _isDisposed) {
+      return;
+    }
+
+    try {
+      // Re-fetch PiP availability
+      // Use isPictureInPictureAvailable() which handles both Android (floating) and iOS (method channel)
+      final isPipAvailable = await isPictureInPictureAvailable();
+      _state = _state.copyWith(isPipAvailable: isPipAvailable);
+      if (!_isPipAvailableController.isClosed) {
+        _isPipAvailableController.add(isPipAvailable);
+      }
+
+      // Re-fetch AirPlay availability (iOS only)
+      final isAirplayAvailable = await _methodChannel!.isAirPlayAvailable();
+      _state = _state.copyWith(isAirplayAvailable: isAirplayAvailable);
+      // Update global AirPlay state manager
+      AirPlayStateManager.instance.updateAvailability(isAirplayAvailable);
+
+      // Re-fetch available qualities if video was loaded before
+      // Even if current state isn't "loaded", we may have qualities cached from before
+      if (_state.qualities.isNotEmpty) {
+        // Emit cached qualities immediately
+        if (!_qualitiesController.isClosed) {
+          _qualitiesController.add(_state.qualities);
+        }
+      }
+
+      // Also try to fetch fresh qualities from native side
+      try {
+        final qualities = await _methodChannel!.getAvailableQualities();
+        if (qualities.isNotEmpty) {
+          _state = _state.copyWith(qualities: qualities);
+          if (!_qualitiesController.isClosed) {
+            _qualitiesController.add(qualities);
+          }
+        }
+      } catch (e) {
+        // Silently handle errors
+      }
+    } catch (e) {
+      // Silently handle errors
+    }
+  }
+
+  /// Adds a listener for activity events (play, pause, buffering, etc.)
+  void addActivityListener(void Function(PlayerActivityEvent) listener) {
+    if (!_activityEventHandlers.contains(listener)) {
+      _activityEventHandlers.add(listener);
+
+      // Immediately notify the new listener of the current state
+      // This ensures listeners added after initialization receive the current state
+      // We check if we have valid state rather than just _isInitialized
+      if (!_isDisposed && _state.duration != Duration.zero) {
+        final currentActivityEvent = PlayerActivityEvent(
+          state: _state.activityState,
+          data: null,
+        );
+        listener(currentActivityEvent);
+      }
+    }
+  }
+
+  /// Removes a listener for activity events
+  void removeActivityListener(void Function(PlayerActivityEvent) listener) =>
+      _activityEventHandlers.remove(listener);
+
+  /// Adds a listener for control events (quality, speed, pip, fullscreen, etc.)
+  void addControlListener(void Function(PlayerControlEvent) listener) {
+    if (!_controlEventHandlers.contains(listener)) {
+      _controlEventHandlers.add(listener);
+
+      // Immediately notify the new listener with a time update event containing current state
+      // This ensures listeners added after initialization receive the current state
+      // We check if we have valid state data (duration > 0) rather than just _isInitialized
+      // because _isInitialized may be false temporarily during reconnection
+      if (!_isDisposed && _state.duration != Duration.zero) {
+        final currentControlEvent = PlayerControlEvent(
+          state: PlayerControlState.timeUpdated,
+          data: {
+            'position': _state.currentPosition.inMilliseconds,
+            'duration': _state.duration.inMilliseconds,
+            'bufferedPosition': _state.bufferedPosition.inMilliseconds,
+            'isBuffering':
+                _state.activityState == PlayerActivityState.buffering,
+          },
+        );
+        listener(currentControlEvent);
+
+        // Also notify about qualities if available
+        if (_state.qualities.isNotEmpty) {
+          final qualityEvent = PlayerControlEvent(
+            state: PlayerControlState.qualityChanged,
+            data: {
+              'qualities': _state.qualities.map((q) => q.toMap()).toList(),
+              'quality': _state.qualities.first.toMap(),
+            },
+          );
+          listener(qualityEvent);
+        }
+      }
+    }
+  }
+
+  /// Removes a listener for control events
+  void removeControlListener(void Function(PlayerControlEvent) listener) =>
+      _controlEventHandlers.remove(listener);
+
+  /// Video URL to play (supports HLS .m3u8 and direct video URLs)
+  /// Returns null if load() has not been called yet
+  String? get url => _url;
+
+  /// Re-loads the last source after the native player was evicted by the iOS
+  /// total-player LRU cap, restoring the pre-eviction position: a forced
+  /// [load] of the retained source. The flag stays set on failure so the
+  /// next [play] retries.
+  Future<void> _reloadEvictedSource() async {
+    final source = _url;
+    if (source == null) {
+      // Nothing was ever loaded, so there is nothing to restore.
+      _needsReloadAfterEviction = false;
+      return;
+    }
+
+    if (_isDisposed || _methodChannel == null) {
+      return;
+    }
+
+    try {
+      // A successful load clears _needsReloadAfterEviction itself.
+      await load(
+        url: source,
+        headers: _lastLoadHeaders,
+        drmConfig: _lastLoadDrmConfig,
+        adConfiguration: _lastAdConfiguration,
+        startAt: _evictionResumePosition,
+        force: true,
+      );
+    } catch (e) {
+      debugPrint('Post-eviction re-load failed: $e');
+    }
+  }
+
+  /// Available video qualities (HLS variants)
+  List<NativeVideoPlayerQuality> get qualities => _state.qualities;
+
+  /// Returns whether the controller has been initialized
+  bool get isInitialized => _isInitialized;
+
+  /// Returns whether the video is currently in fullscreen mode
+  bool get isFullScreen => _state.isFullScreen;
+
+  /// Returns the current playback position as a Duration
+  Duration get currentPosition => _state.currentPosition;
+
+  /// Returns the total video duration as a Duration
+  Duration get duration => _state.duration;
+
+  /// Returns the buffered position as a Duration (how far the video has been buffered)
+  Duration get bufferedPosition => _state.bufferedPosition;
+
+  /// Returns the current volume (0.0 to 1.0)
+  double get volume => _state.volume;
+
+  /// Returns the current activity state (playing, paused, buffering, etc.)
+  PlayerActivityState get activityState => _state.activityState;
+
+  /// Returns the current control state (quality change, pip, fullscreen, etc.)
+  PlayerControlState get controlState => _state.controlState;
+
+  /// Current player state
+  NativeVideoPlayerState get state => _state;
+
+  /// Returns the current playback speed
+  double get speed => _state.speed;
+
+  /// Returns whether Picture-in-Picture mode is currently active
+  bool get isPipEnabled => _state.isPipEnabled;
+
+  /// Returns whether Picture-in-Picture is available on the device
+  bool get isPipAvailable => _state.isPipAvailable;
+
+  /// Returns whether AirPlay is available on the device
+  ///
+  /// This is a global state - if AirPlay is available, it's available for all controllers
+  bool get isAirplayAvailable =>
+      AirPlayStateManager.instance.isAirPlayAvailable;
+
+  /// Returns whether the video is currently connected to an AirPlay/Cast device
+  ///
+  /// This is a global state - when the app is connected to AirPlay, all controllers are connected
+  bool get isAirplayConnected =>
+      AirPlayStateManager.instance.isAirPlayConnected;
+
+  /// Returns whether the video is currently connecting to an AirPlay device
+  ///
+  /// This is a global state - indicates a connection attempt is in progress
+  bool get isAirplayConnecting =>
+      AirPlayStateManager.instance.isAirPlayConnecting;
+
+  /// Returns the name of the currently connected AirPlay device
+  ///
+  /// Returns null if not connected to any AirPlay device
+  String? get airPlayDeviceName =>
+      AirPlayStateManager.instance.airPlayDeviceName;
+
+  /// Stream of buffered position changes
+  Stream<Duration> get bufferedPositionStream =>
+      _bufferedPositionController.stream;
+
+  /// Stream of duration changes
+  Stream<Duration> get durationStream => _durationController.stream;
+
+  /// Stream of player state changes (playing, paused, buffering, etc.)
+  Stream<PlayerActivityState> get playerStateStream =>
+      _playerStateController.stream;
+
+  /// Stream of position changes
+  Stream<Duration> get positionStream => _positionController.stream;
+
+  /// Stream of playback speed changes
+  Stream<double> get speedStream => _speedController.stream;
+
+  /// Stream of Picture-in-Picture enabled state changes
+  Stream<bool> get isPipEnabledStream => _isPipEnabledController.stream;
+
+  /// Stream of Picture-in-Picture availability changes
+  Stream<bool> get isPipAvailableStream => _isPipAvailableController.stream;
+
+  /// Stream of AirPlay availability changes
+  ///
+  /// This is a global stream - all controllers receive the same AirPlay availability state
+  Stream<bool> get isAirplayAvailableStream =>
+      AirPlayStateManager.instance.isAirPlayAvailableStream;
+
+  /// Stream of AirPlay connection state changes
+  ///
+  /// This is a global stream - all controllers receive the same AirPlay connection state
+  Stream<bool> get isAirplayConnectedStream =>
+      AirPlayStateManager.instance.isAirPlayConnectedStream;
+
+  /// Stream of AirPlay connecting state changes
+  ///
+  /// This is a global stream - emits true when connecting to AirPlay, false when connection completes or fails
+  Stream<bool> get isAirplayConnectingStream =>
+      AirPlayStateManager.instance.isAirPlayConnectingStream;
+
+  /// Stream of AirPlay device name changes
+  ///
+  /// Emits the device name when connected to an AirPlay device, or null when disconnected
+  Stream<String?> get airPlayDeviceNameStream =>
+      AirPlayStateManager.instance.airPlayDeviceNameStream;
+
+  /// Stream of fullscreen state changes
+  Stream<bool> get isFullscreenStream => _isFullscreenController.stream;
+
+  /// Latest native video dimensions (reported by texture-rendered views;
+  /// null until the first frame's size is known).
+  NativeVideoPlayerVideoSize? get videoSize => _videoSize;
+
+  /// Stream of native video dimension changes (texture-rendered views).
+  Stream<NativeVideoPlayerVideoSize> get videoSizeStream =>
+      _videoSizeController.stream;
+
+  /// Marks [platformViewId] as texture-rendered. Called by the widget right
+  /// before [onPlatformViewCreated] for texture backends — these have no
+  /// native view, so fullscreen falls back to the Dart path.
+  void registerTextureView(int platformViewId) {
+    _textureViewIds.add(platformViewId);
+  }
+
+  /// Whether the primary view is a texture-rendered backend.
+  bool get _primaryViewIsTexture =>
+      _primaryPlatformViewId != null &&
+      _textureViewIds.contains(_primaryPlatformViewId);
+
+  /// Stream of quality changes
+  Stream<NativeVideoPlayerQuality> get qualityChangedStream =>
+      _qualityChangedController.stream;
+
+  /// Stream of available qualities list changes
+  Stream<List<NativeVideoPlayerQuality>> get qualitiesStream =>
+      _qualitiesController.stream;
+
+  /// Parameters passed to native side when creating the platform view
+  /// Includes controller ID, autoPlay, PiP settings, media info, and fullscreen state
+  Map<String, dynamic> get creationParams => <String, dynamic>{
+    'controllerId': id,
+    'autoPlay': autoPlay,
+    'allowsPictureInPicture': allowsPictureInPicture,
+    'canStartPictureInPictureAutomatically':
+        canStartPictureInPictureAutomatically,
+    'showNativeControls': _hasCustomOverlay
+        ? false
+        : showNativeControls, // Hide native controls if we have custom overlay, otherwise use parameter
+    'isFullScreen': _state.isFullScreen,
+    'enableHDR': enableHDR,
+    'enableLooping': enableLooping,
+    'preventFullscreenSwipeDismiss': preventFullscreenSwipeDismiss,
+    'timeUpdateIntervalMs':
+        NativeVideoPlayerConfig.global.timeUpdateInterval.inMilliseconds,
+    'qualityForViewport': NativeVideoPlayerConfig.global.qualityForViewportSize,
+    'viewportCapHeadroom': NativeVideoPlayerConfig.global.viewportCapHeadroom,
+    'prioritizeActivePlayback':
+        NativeVideoPlayerConfig.global.prioritizeActivePlayback,
+    'lightweightInlineViews':
+        NativeVideoPlayerConfig.global.lightweightInlineViews,
+    'androidEnableDiskCache':
+        NativeVideoPlayerConfig.global.androidEnableDiskCache,
+    'androidDiskCacheMaxBytes':
+        NativeVideoPlayerConfig.global.androidDiskCacheMaxBytes,
+    'androidForceSoftwareDecoders':
+        NativeVideoPlayerConfig.global.androidForceSoftwareDecoders,
+    'iosMaxTotalPlayers': NativeVideoPlayerConfig.global.iosMaxTotalPlayers,
+    if (NativeVideoPlayerConfig.global.androidBufferConfig != null)
+      'androidBufferConfig': NativeVideoPlayerConfig.global.androidBufferConfig!
+          .toMap(),
+    if (NativeVideoPlayerConfig.global.iosBufferConfig != null)
+      'iosBufferConfig': NativeVideoPlayerConfig.global.iosBufferConfig!
+          .toMap(),
+    if (mediaInfo != null) 'mediaInfo': mediaInfo!.toMap(),
+  };
+
+  /// Sets the overlay builder for fullscreen mode
+  ///
+  /// This is typically called by NativeVideoPlayer widget to pass the overlay builder.
+  /// When an overlay is set, native controls are automatically hidden and Dart fullscreen is used.
+  void setOverlayBuilder(
+    Widget Function(BuildContext, NativeVideoPlayerController)? builder,
+  ) {
+    _overlayBuilder = builder;
+
+    // If we have a method channel, hide native controls when overlay is set
+    if (_hasCustomOverlay && _methodChannel != null) {
+      setShowNativeControls(false);
+    }
+  }
+
+  /// Sets the sidecar subtitle style for fullscreen mode
+  ///
+  /// Typically called by the NativeVideoPlayer widget so the Dart fullscreen
+  /// host (which builds its own NativeVideoPlayer) renders captions with the
+  /// same style as the inline player.
+  ///
+  /// [NativeVideoPlayerSubtitleStyle.embeddedTextScale] is additionally
+  /// pushed to the platform caption renderer (fire-and-forget) when it
+  /// changed since the last call.
+  void setSubtitleStyle(NativeVideoPlayerSubtitleStyle style) {
+    _subtitleStyle = style;
+
+    if (style.embeddedTextScale != _embeddedTextScale) {
+      _embeddedTextScale = style.embeddedTextScale;
+      unawaited(_methodChannel?.setEmbeddedTextScale(style.embeddedTextScale));
+    }
+  }
+
+  /// Sets the callback for closing Dart fullscreen
+  /// This is called by FullscreenVideoPlayer to register itself
+  void setDartFullscreenCloseCallback(VoidCallback? callback) {
+    _dartFullscreenCloseCallback = callback;
+  }
+
+  /// Called when a native platform view is created
+  ///
+  /// Multiple platform views can register with the same controller.
+  /// Each platform view gets its own event channel listener to receive events.
+  /// The first platform view becomes the primary view that handles method channel communication.
+  ///
+  /// **Parameters:**
+  /// - platformViewId: The unique ID assigned by Flutter to the platform view
+  Future<void> onPlatformViewCreated(
+    int platformViewId,
+    BuildContext context,
+  ) async {
+    // Check if we're reconnecting BEFORE adding the new view ID
+    final bool wasDisconnected = _platformViewIds.isEmpty;
+
+    _platformViewIds.add(platformViewId);
+
+    // Store context for Dart fullscreen
+    _platformViewContexts[platformViewId] = context;
+
+    // Always update to use the most recent platform view
+    // This ensures commands go to the active view
+    _updateMethodChannel(platformViewId);
+
+    // If we're reconnecting after all platform views were disposed, refresh availability flags
+    if (wasDisconnected) {
+      // Ask native to reconnect surface for this view (Android reconnects ExoPlayer surface;
+      // iOS no-ops). Ensures video shows when returning from detail to inline (list→detail→back).
+      if (_methodChannel != null) {
+        await _methodChannel!.ensureSurfaceConnected();
+      }
+
+      // Re-apply the embedded caption text scale — the recreated native view
+      // builds its SubtitleView with the platform default size.
+      if (_embeddedTextScale != 1.0 && _methodChannel != null) {
+        await _methodChannel!.setEmbeddedTextScale(_embeddedTextScale);
+      }
+
+      // Re-fetch availability flags from native side FIRST (wait for it to complete)
+      // This ensures the state is up-to-date before we emit it
+      await _refreshAvailabilityFlags();
+
+      // Ensure native controls are hidden if we have a custom overlay
+      // This is critical when rapidly navigating - the overlay builder persists
+      // but native controls might not have been hidden during the reconnection
+      if (_hasCustomOverlay && _methodChannel != null) {
+        await setShowNativeControls(false);
+      }
+
+      // Enable automatic PiP on Android if configured
+      await _enableAutomaticPiP();
+    }
+
+    _emitCurrentState();
+
+    // ALWAYS notify all event handler listeners about the current state
+    // This ensures listeners added via add*Listener methods receive the current state
+
+    // Notify AirPlay availability listeners
+    for (final handler in _airPlayAvailabilityHandlers) {
+      handler(_state.isAirplayAvailable);
+    }
+
+    // Notify AirPlay connection listeners
+    for (final handler in _airPlayConnectionHandlers) {
+      handler(_state.isAirplayConnected);
+    }
+
+    // Notify activity event listeners with the current activity state
+    if (_activityEventHandlers.isNotEmpty) {
+      final currentActivityEvent = PlayerActivityEvent(
+        state: _state.activityState,
+        data: null,
+      );
+      for (final handler in _activityEventHandlers) {
+        handler(currentActivityEvent);
+      }
+    }
+
+    // Notify control event listeners if there's a current control state
+    if (_controlEventHandlers.isNotEmpty &&
+        _state.controlState != PlayerControlState.none) {
+      final currentControlEvent = PlayerControlEvent(
+        state: _state.controlState,
+        data: null,
+      );
+      for (final handler in _controlEventHandlers) {
+        handler(currentControlEvent);
+      }
+    }
+
+    // Safety net: if the constructor's controller-channel setup failed (e.g.
+    // plugin not attached yet), retry now — a platform view existing proves
+    // the plugin is attached.
+    unawaited(_ensureControllerEventChannel());
+
+    // IMPORTANT: Set up event channel for EVERY platform view
+    // This ensures that both the original and fullscreen widgets receive events
+    // Use retry logic to handle race condition where native side hasn't finished initializing
+    unawaited(_subscribeToEventChannelWithRetry(platformViewId));
+  }
+
+  /// Callback for AirPlay availability changes
+  final List<void Function(bool isAvailable)> _airPlayAvailabilityHandlers =
+      <void Function(bool)>[];
+
+  /// Callback for AirPlay connection changes
+  final List<void Function(bool isConnected)> _airPlayConnectionHandlers =
+      <void Function(bool)>[];
+
+  /// Adds a listener for AirPlay availability changes
+  void addAirPlayAvailabilityListener(void Function(bool) listener) {
+    if (!_airPlayAvailabilityHandlers.contains(listener)) {
+      _airPlayAvailabilityHandlers.add(listener);
+
+      // Immediately notify the new listener of the current state
+      // This ensures listeners added after initialization receive the current state
+      if (_isInitialized && !_isDisposed) {
+        listener(_state.isAirplayAvailable);
+      }
+    }
+  }
+
+  /// Removes a listener for AirPlay availability changes
+  void removeAirPlayAvailabilityListener(void Function(bool) listener) =>
+      _airPlayAvailabilityHandlers.remove(listener);
+
+  /// Adds a listener for AirPlay connection changes (when video connects/disconnects to AirPlay)
+  void addAirPlayConnectionListener(void Function(bool) listener) {
+    if (!_airPlayConnectionHandlers.contains(listener)) {
+      _airPlayConnectionHandlers.add(listener);
+
+      // Immediately notify the new listener of the current state
+      // This ensures listeners added after initialization receive the current state
+      if (_isInitialized && !_isDisposed) {
+        listener(_state.isAirplayConnected);
+      }
+    }
+  }
+
+  /// Removes a listener for AirPlay connection changes
+  void removeAirPlayConnectionListener(void Function(bool) listener) =>
+      _airPlayConnectionHandlers.remove(listener);
+
+  /// Safely cancels a stream subscription, handling MissingPluginException gracefully
+  ///
+  /// When the native side has already disposed the EventChannel StreamHandler,
+  /// cancelling the subscription will throw a MissingPluginException. This is harmless
+  /// and indicates the native side has already cleaned up, so we ignore it.
+  ///
+  /// **Parameters:**
+  /// - subscription: The subscription to cancel, may be null
+  ///
+  /// **Returns:**
+  /// A Future that completes when the cancellation is attempted (or immediately if subscription is null)
+  Future<void> _safeCancelSubscription(
+    StreamSubscription<dynamic>? subscription,
+  ) async {
+    if (subscription == null) {
+      return;
+    }
+    try {
+      await subscription.cancel().timeout(const Duration(seconds: 3));
+    } on MissingPluginException {
+      // Native side has already disposed the EventChannel StreamHandler
+      // This is harmless and safe to ignore
+    } on TimeoutException {
+      // A detached native EventChannel may never acknowledge cancellation.
+      // Cleanup must not block controller disposal indefinitely.
+    } catch (e) {
+      // Log other exceptions in debug mode for debugging purposes
+      if (kDebugMode) {
+        debugPrint('Error cancelling subscription: $e');
+      }
+    }
+  }
+
+  /// Called when a platform view is disposed
+  ///
+  /// Unregisters the platform view from this controller.
+  /// If it was the primary view, promotes another view to primary.
+  ///
+  /// **Parameters:**
+  /// - platformViewId: The ID of the platform view being disposed
+  void onPlatformViewDisposed(int platformViewId) {
+    _platformViewIds.remove(platformViewId);
+    _platformViewContexts.remove(platformViewId);
+    _textureViewIds.remove(platformViewId);
+
+    // Cancel the event channel subscription first, then release the native
+    // per-view channel handlers: on iOS the EventChannel handler strongly
+    // retains the platform view, so its deinit is unreachable until the
+    // handler is deregistered.
+    final subscription = _eventSubscriptions.remove(platformViewId);
+    unawaited(
+      _safeCancelSubscription(subscription).then(
+        (_) => VideoPlayerMethodChannel.notifyViewDisposed(platformViewId),
+      ),
+    );
+
+    // If the disposed view was the primary view, switch to another active view
+    if (_primaryPlatformViewId == platformViewId &&
+        _platformViewIds.isNotEmpty) {
+      // Use the most recent remaining view
+      final newPrimaryViewId = _platformViewIds.last;
+      _updateMethodChannel(newPrimaryViewId);
+    }
+  }
+
+  /// Loads a video URL or local file into the already initialized player
+  ///
+  /// Must be called after the platform view is created and channels are set up.
+  /// This method loads the video URL on the native side and fetches available qualities.
+  /// If multiple platform views are using this controller, they will all sync to the same video.
+  ///
+  /// **Parameters:**
+  /// - url: Video URL to play (supports HLS, MP4, and local file:// URIs)
+  /// - headers: Optional HTTP headers to include with the video request (e.g., {"Referer": "domain"})
+  /// - drmConfig: Optional DRM configuration for protected content
+  ///   - type: DRM type ('widevine', 'fairplay', 'clearKey', or 'aes-128')
+  ///   - licenseUrl: License server URL
+  ///   - certificateUrl: Certificate URL (iOS FairPlay only)
+  ///   - headers: HTTP headers for license requests
+  ///   - key: (aes-128 only) Optional 32-character hex string (16 bytes).
+  ///          When provided the player uses this exact key and ignores the
+  ///          key URI present in the .m3u8 playlist.
+  ///
+  /// **Returns:**
+  /// A Future that completes when the video is loaded
+  ///
+  /// **Note:** For better clarity, consider using [loadUrl] for remote videos or [loadFile] for local files.
+  ///
+  /// Pass [startAt] to begin playback at a stored resume position — the
+  /// position is applied natively before the first frame, so there is no
+  /// visible seek after playback starts.
+  ///
+  /// [force] loads even when the current state is `loaded` (the guard that
+  /// prevents accidental double-loads). Use it to replace the current video
+  /// with a different one, e.g. for playlist advancement.
+  Future<void> load({
+    required String url,
+    Map<String, String>? headers,
+    Map<String, dynamic>? drmConfig,
+    NativeVideoPlayerAdConfiguration? adConfiguration,
+    List<NativeVideoPlayerSidecarSubtitle>? sidecarSubtitles,
+    Duration? startAt,
+    bool force = false,
+  }) async {
+    if (!force && _state.activityState.isLoaded) {
+      return;
+    }
+
+    // Check if initialized - if method channel exists and platform view is created,
+    // consider it initialized even if _isInitialized flag hasn't been set yet
+    if (!_isInitialized &&
+        (_methodChannel == null || _platformViewIds.isEmpty)) {
+      throw Exception('Controller not initialized. Call initialize() first.');
+    }
+
+    if (_methodChannel == null) {
+      throw Exception(
+        'Method channel not initialized. Platform view not created.',
+      );
+    }
+
+    // Validate custom AES-128 key if provided in drmConfig.
+    // Key must be a 32-character hexadecimal string (exactly 16 bytes).
+    if (drmConfig != null) {
+      final type = (drmConfig['type'] as String?)?.toLowerCase();
+      final key = drmConfig['key'] as String?;
+      if (type == 'aes-128' && key != null) {
+        if (key.length != 32) {
+          throw ArgumentError(
+            'AES-128 key must be exactly 32 hexadecimal characters (16 bytes). '
+            'Got length ${key.length}.',
+          );
+        }
+        if (!RegExp(r'^[0-9a-fA-F]+$').hasMatch(key)) {
+          throw ArgumentError(
+            'AES-128 key must contain only hexadecimal characters (0-9, a-f, A-F).',
+          );
+        }
+      }
+    }
+
+    _url = url;
+
+    // This configures only the optional Dart-side ad state machine. Native
+    // playback remains unchanged until a later platform-adapter phase.
+    advertisementController._configureForContent(
+      adConfiguration,
+      contentActivityState: _state.activityState,
+    );
+    _resetMidRollSchedule();
+    _postRollTriggered = false;
+    _postRollRequestInFlight = false;
+
+    // Retained for the eviction re-load (see _reloadEvictedSource).
+    _lastLoadHeaders = headers;
+    _lastLoadDrmConfig = drmConfig;
+    _lastAdConfiguration = adConfiguration;
+
+    final preRollConfiguration = adConfiguration;
+    final isVmapConfiguration =
+      preRollConfiguration?.enabled == true &&
+      preRollConfiguration?.tagType == NativeVideoPlayerAdTagType.vmap;
+    final hasPreRoll =
+      preRollConfiguration?.enabled == true &&
+      preRollConfiguration?.preRollBreaks.isNotEmpty == true;
+    final hasVmapAds = isVmapConfiguration;
+
+    // An A-B range only makes sense for the video it was set on.
+    _playbackRange = null;
+
+    if (sidecarSubtitles != null) {
+      _sidecarSubtitles.setSources(sidecarSubtitles);
+    }
+
+    try {
+      await _methodChannel!.load(
+        url: url,
+        autoPlay: autoPlay && !hasPreRoll && !isVmapConfiguration,
+        headers: headers,
+        mediaInfo: mediaInfo?.toMap(),
+        drmConfig: drmConfig,
+        adConfiguration: adConfiguration?.toMap(),
+        // Android attaches URL sources natively (MediaItem.SubtitleConfiguration)
+        // so captions can also render in PiP/native fullscreen; iOS and
+        // non-URL sources render through the Flutter overlay only.
+        sidecarSubtitles: _androidSidecarMaps(sidecarSubtitles),
+        startAtMs: startAt?.inMilliseconds,
+      );
+
+      if (preRollConfiguration != null && (hasPreRoll || hasVmapAds)) {
+        await _methodChannel!.initializeAdvertisement(preRollConfiguration);
+        await _methodChannel!.requestAdvertisements();
+      }
+
+      // Re-apply the embedded caption text scale to the fresh player item.
+      if (_embeddedTextScale != 1.0) {
+        await _methodChannel!.setEmbeddedTextScale(_embeddedTextScale);
+      }
+
+      // The native load (re)created the player, so any pending eviction
+      // re-load is satisfied.
+      _needsReloadAfterEviction = false;
+
+      // Fetch available qualities after loading
+      final qualities = await _methodChannel!.getAvailableQualities();
+
+      _updateState(
+        _state.copyWith(
+          qualities: qualities,
+          activityState: PlayerActivityState.loaded,
+        ),
+      );
+
+      // Notify control listeners about available qualities
+      if (qualities.isNotEmpty) {
+        final qualityEvent = PlayerControlEvent(
+          state: PlayerControlState.qualityChanged,
+          data: {
+            'qualities': qualities.map((q) => q.toMap()).toList(),
+            if (qualities.isNotEmpty) 'quality': qualities.first.toMap(),
+          },
+        );
+
+        for (final handler in _controlEventHandlers) {
+          handler(qualityEvent);
+        }
+      }
+    } catch (e) {
+      rethrow;
+    }
+  }
+
+  /// Loads a remote video URL into the player
+  ///
+  /// This is a convenience method that explicitly loads a remote video URL.
+  /// Supports HLS streams (.m3u8), MP4, and other formats supported by the native player.
+  ///
+  /// **Parameters:**
+  /// - url: Remote video URL (e.g., "https://example.com/video.mp4")
+  /// - headers: Optional HTTP headers to include with the video request
+  /// - drmConfig: Optional DRM configuration for protected content
+  ///   - type: DRM type ('widevine', 'fairplay', 'clearKey', or 'aes-128')
+  ///   - licenseUrl: License server URL
+  ///   - certificateUrl: Certificate URL (iOS FairPlay only)
+  ///   - headers: HTTP headers for license requests
+  ///
+  /// **Example:**
+  /// ```dart
+  /// // Load HLS stream
+  /// await controller.loadUrl(
+  ///   url: 'https://example.com/video.m3u8',
+  /// );
+  ///
+  /// // Load MP4 with custom headers
+  /// await controller.loadUrl(
+  ///   url: 'https://example.com/video.mp4',
+  ///   headers: {'Referer': 'https://example.com'},
+  /// );
+  ///
+  /// // Load with DRM (FairPlay on iOS)
+  /// await controller.loadUrl(
+  ///   url: 'https://example.com/stream.m3u8',
+  ///   drmConfig: {
+  ///     'type': 'fairplay',
+  ///     'licenseUrl': 'https://license.server.com/get',
+  ///     'certificateUrl': 'https://cert.server.com/cert.der',
+  ///     'headers': {
+  ///       'Authorization': 'Bearer <token>'
+  ///     }
+  ///   }
+  /// );
+  /// ```
+  Future<void> loadUrl({
+    required String url,
+    Map<String, String>? headers,
+    Map<String, dynamic>? drmConfig,
+    NativeVideoPlayerAdConfiguration? adConfiguration,
+    Duration? startAt,
+    bool force = false,
+  }) async {
+    return load(
+      url: url,
+      headers: headers,
+      drmConfig: drmConfig,
+      adConfiguration: adConfiguration,
+      startAt: startAt,
+      force: force,
+    );
+  }
+
+  /// Loads a local video file into the player
+  ///
+  /// This is a convenience method for loading videos from device storage.
+  /// Automatically handles the file:// URI scheme construction.
+  ///
+  /// **Parameters:**
+  /// - path: Absolute path to the local video file
+  ///
+  /// **Example:**
+  /// ```dart
+  /// // Android
+  /// await controller.loadFile(
+  ///   path: '/storage/emulated/0/DCIM/video.mp4',
+  /// );
+  ///
+  /// // iOS
+  /// await controller.loadFile(
+  ///   path: '/var/mobile/Media/DCIM/100APPLE/video.MOV',
+  /// );
+  /// ```
+  ///
+  /// **Note:** The path should be an absolute path to the file.
+  /// For accessing app documents or bundle resources, use the appropriate
+  /// path_provider methods to get the correct paths.
+  Future<void> loadFile({required String path}) async {
+    // Construct file:// URI if not already provided
+    final fileUrl = path.startsWith('file://') ? path : 'file://$path';
+    return load(url: fileUrl);
+  }
+
+  /// Starts or resumes video playback
+  ///
+  /// If the native player was torn down by the iOS total-player LRU cap
+  /// (see [NativeVideoPlayerConfig.iosMaxTotalPlayers]), the last source is
+  /// transparently re-loaded at the pre-eviction position first.
+  Future<void> play() async {
+    if (_needsReloadAfterEviction) {
+      await _reloadEvictedSource();
+    }
+
+    await _methodChannel?.play();
+  }
+
+  /// Pauses video playback
+  Future<void> pause() async {
+    await _methodChannel?.pause();
+  }
+
+  /// Seeks to a specific position
+  Future<void> seekTo(Duration position) async {
+    await _methodChannel?.seekTo(position);
+  }
+
+  /// The active A-B playback range, or null when playback is unrestricted.
+  NativeVideoPlayerPlaybackRange? get playbackRange => _playbackRange;
+  NativeVideoPlayerPlaybackRange? _playbackRange;
+
+  /// Guards against re-triggering range handling on every position tick
+  /// while the boundary seek/pause is still in flight.
+  bool _rangeActionInFlight = false;
+
+  /// Confines playback to [start]..[end] (A-B loop / clip range).
+  ///
+  /// With [loop] (default) the player seeks back to [start] whenever the
+  /// position reaches [end]; with `loop: false` it pauses once at [end] and
+  /// the range is released. If the current position is outside the range,
+  /// playback seeks to [start] immediately. Enforcement runs on the
+  /// existing position updates, so boundary precision follows the
+  /// configured time-update interval. Cleared by [clearPlaybackRange] and
+  /// by loading a new video.
+  Future<void> setPlaybackRange({
+    required Duration start,
+    required Duration end,
+    bool loop = true,
+  }) async {
+    final range = NativeVideoPlayerPlaybackRange(
+      start: start,
+      end: end,
+      loop: loop,
+    );
+    _playbackRange = range;
+    _rangeActionInFlight = false;
+    if (!range.contains(_state.currentPosition)) {
+      await seekTo(start);
+    }
+  }
+
+  /// Removes the A-B playback range; playback continues unrestricted.
+  void clearPlaybackRange() {
+    _playbackRange = null;
+    _rangeActionInFlight = false;
+  }
+
+  /// Enforces the A-B range on position updates (called from
+  /// [_updateState] whenever the position changes).
+  void _enforcePlaybackRange(Duration position) {
+    final range = _playbackRange;
+    if (range == null || _rangeActionInFlight || position < range.end) {
+      return;
+    }
+    _rangeActionInFlight = true;
+    if (range.loop) {
+      unawaited(
+        seekTo(range.start).whenComplete(() => _rangeActionInFlight = false),
+      );
+    } else {
+      // One-shot clip range: stop at the end and release the range so the
+      // user can seek/replay freely afterwards.
+      _playbackRange = null;
+      unawaited(pause().whenComplete(() => _rangeActionInFlight = false));
+    }
+  }
+
+  /// Sets the volume
+  Future<void> setVolume(double volume) async {
+    await _methodChannel?.setVolume(volume);
+    _updateState(_state.copyWith(volume: volume));
+  }
+
+  /// Sets the playback speed
+  Future<void> setSpeed(double speed) async {
+    await _methodChannel?.setSpeed(speed);
+  }
+
+  /// Scales the text size of EMBEDDED (native-rendered) subtitle tracks.
+  /// 1.0 = platform default. No effect on the sidecar overlay (use
+  /// [setSubtitleStyle] / `subtitleStyle.fontSize` for that). Issue #43.
+  ///
+  /// Takes effect live and survives item reloads and native view recreation.
+  Future<void> setNativeSubtitleTextScale(double scale) async {
+    _embeddedTextScale = scale;
+    _subtitleStyle = (_subtitleStyle ?? const NativeVideoPlayerSubtitleStyle())
+        .copyWith(embeddedTextScale: scale);
+    await _methodChannel?.setEmbeddedTextScale(scale);
+  }
+
+  /// Sets whether the video should loop
+  Future<void> setLooping(bool looping) async {
+    await _methodChannel?.setLooping(looping);
+  }
+
+  /// Sets the video quality
+  Future<void> setQuality(NativeVideoPlayerQuality quality) async {
+    await _methodChannel?.setQuality(quality);
+  }
+
+  /// Gets available subtitle tracks: tracks EMBEDDED in the media plus any
+  /// sidecar (external VTT/SRT) sources provided via [setSidecarSubtitles]
+  /// or `load(sidecarSubtitles:)`, distinguished by
+  /// [NativeVideoPlayerSubtitleTrack.source].
+  Future<List<NativeVideoPlayerSubtitleTrack>>
+  getAvailableSubtitleTracks() async {
+    final embedded =
+        await _methodChannel?.getAvailableSubtitleTracks() ??
+        <NativeVideoPlayerSubtitleTrack>[];
+    final int? selectedSidecar = _sidecarSubtitles.selectedSource;
+    final sources = _sidecarSubtitles.sources;
+
+    // On Android, URL sidecars are also attached natively (so captions can
+    // render in PiP / native fullscreen), so they echo back in `embedded`.
+    // Suppress those native echoes by language — each caption then appears
+    // once, and the Dart sidecar entry below is the canonical, overlay-rendered
+    // representation. On iOS nothing is sideloaded natively, so genuine
+    // embedded tracks (e.g. an HLS "CC") are left untouched.
+    final Set<String> nativelyAttachedLanguages =
+        _androidSidecarMaps(sources) == null
+        ? const <String>{}
+        : sources.where((s) => s.url != null).map((s) => s.language).toSet();
+
+    return <NativeVideoPlayerSubtitleTrack>[
+      // While a sidecar track renders, embedded tracks are natively disabled,
+      // so their stale isSelected flags are cleared.
+      for (final track in embedded)
+        if (!nativelyAttachedLanguages.contains(track.language))
+          selectedSidecar != null ? track.copyWith(isSelected: false) : track,
+      for (var i = 0; i < sources.length; i++)
+        NativeVideoPlayerSubtitleTrack(
+          index: i,
+          language: sources[i].language,
+          displayName: sources[i].label,
+          isSelected: selectedSidecar == i,
+          source: SubtitleTrackSource.sidecar,
+        ),
+    ];
+  }
+
+  /// Sets the subtitle track.
+  ///
+  /// Works for both embedded tracks and sidecar tracks (see
+  /// [NativeVideoPlayerSubtitleTrack.source]). Pass a track with index -1 or
+  /// use NativeVideoPlayerSubtitleTrack.off() to disable subtitles.
+  Future<void> setSubtitleTrack(NativeVideoPlayerSubtitleTrack track) async {
+    if (track.source == SubtitleTrackSource.sidecar) {
+      try {
+        await _sidecarSubtitles.select(track.index);
+      } catch (e) {
+        // A broken subtitle source must never break playback.
+        debugPrint(
+          'Failed to load sidecar subtitle "${track.displayName}": $e',
+        );
+        return;
+      }
+      // Prevent double captions: disable any embedded native track.
+      await _methodChannel?.setSubtitleTrack(
+        NativeVideoPlayerSubtitleTrack.off(),
+      );
+      _emitSubtitleChanged(track);
+      return;
+    }
+
+    // Embedded track (or Off): stop sidecar rendering, delegate to native
+    // (which emits its own subtitleChange event).
+    _sidecarSubtitles.deselect();
+    await _methodChannel?.setSubtitleTrack(track);
+  }
+
+  /// Gets the alternate audio tracks of the current media (multiple
+  /// languages, audio description, commentary). Empty for single-audio
+  /// content. Issues #23/#16.
+  Future<List<NativeVideoPlayerAudioTrack>> getAvailableAudioTracks() async {
+    return await _methodChannel?.getAvailableAudioTracks() ??
+        <NativeVideoPlayerAudioTrack>[];
+  }
+
+  /// Selects an alternate audio track from [getAvailableAudioTracks].
+  /// Control listeners receive a [PlayerControlState.audioTrackChanged] event.
+  Future<void> setAudioTrack(NativeVideoPlayerAudioTrack track) async {
+    await _methodChannel?.setAudioTrack(track);
+  }
+
+  /// Replaces the sidecar (external VTT/SRT) subtitle sources.
+  ///
+  /// Selection resets to off; use [setSubtitleTrack] with one of the sidecar
+  /// entries from [getAvailableSubtitleTracks] to activate one. On Android,
+  /// URL sources are also attached natively so captions can render in PiP
+  /// and native fullscreen.
+  Future<void> setSidecarSubtitles(
+    List<NativeVideoPlayerSidecarSubtitle> sources,
+  ) async {
+    _sidecarSubtitles.setSources(sources);
+    final androidMaps = _androidSidecarMaps(sources);
+    if (androidMaps != null && _methodChannel != null) {
+      await _methodChannel!.setSidecarSubtitles(androidMaps);
+    }
+  }
+
+  /// Hands sidecar caption rendering between the Flutter overlay and
+  /// Android's native SubtitleView depending on context: PiP and NATIVE
+  /// fullscreen don't show Flutter UI, so the natively sideloaded track is
+  /// selected there; Dart fullscreen (custom overlay) keeps the Flutter
+  /// overlay. iOS has no native sideload — the overlay simply hides in PiP.
+  void _syncNativeSidecarCaptions(NativeVideoPlayerState state) {
+    if (kIsWeb || !Platform.isAndroid) {
+      return;
+    }
+    final int? selected = _sidecarSubtitles.selectedSource;
+    if (selected == null) {
+      return;
+    }
+    // PiP suppresses captions entirely (see _suppressSubtitlesForPip); only
+    // hand off to the native SubtitleView for non-PiP native-fullscreen
+    // contexts where the Flutter overlay is not visible.
+    final bool nativeContext =
+        !state.isPipEnabled && state.isFullScreen && !_hasCustomOverlay;
+    unawaited(
+      _methodChannel?.setNativeSidecarActive(
+        active: nativeContext,
+        language: nativeContext
+            ? _sidecarSubtitles.sources[selected].language
+            : null,
+      ),
+    );
+  }
+
+  /// Hides all native subtitle rendering while in Android PiP and restores the
+  /// prior selection on leaving it.
+  ///
+  /// In PiP the Flutter subtitle overlay is not part of the (tiny) PiP window,
+  /// so captions are rendered by the native Media3 `SubtitleView` at the system
+  /// default size — which looks oversized in the small window. Toggling the
+  /// player's text track type (shared across views) suppresses every subtitle
+  /// source (embedded and sidecar) with one call; the native side snapshots the
+  /// pre-PiP state so the exact selection resumes on exit. Android-only — iOS
+  /// has no native sideload and already hides the overlay in PiP.
+  void _suppressSubtitlesForPip(bool suppressed) {
+    if (kIsWeb || !Platform.isAndroid) {
+      return;
+    }
+    unawaited(_methodChannel?.setSubtitlesSuppressedForPip(suppressed));
+  }
+
+  /// Ground-truth Picture-in-Picture status.
+  ///
+  /// [isPipEnabled] is event-driven on iOS but poll-derived on Android
+  /// (150 ms cadence, and only while fullscreen), so it can be stale at
+  /// exactly the moment the app backgrounds into PiP. On Android this
+  /// queries the platform's `isInPictureInPictureMode` directly and
+  /// refreshes the synchronous flag with the result; pause decisions made
+  /// on lifecycle transitions (see BackgroundPlaybackGuard) must use this
+  /// instead of [isPipEnabled]. Falls back to the last known flag if the
+  /// platform query fails.
+  Future<bool> getPictureInPictureStatus() async {
+    if (kIsWeb || _isDisposed || !Platform.isAndroid) {
+      return _state.isPipEnabled;
+    }
+
+    try {
+      final bool inPip = (await _floating.pipStatus) == PiPStatus.enabled;
+      if (!_isDisposed && inPip != _state.isPipEnabled) {
+        _updateState(_state.copyWith(isPipEnabled: inPip));
+      }
+      return inPip;
+    } catch (_) {
+      return _state.isPipEnabled;
+    }
+  }
+
+  /// Starts/stops polling Android's PiP status so [isPipEnabled] reflects the
+  /// real PiP state.
+  ///
+  /// Unlike iOS (which emits `pipStart`/`pipStop` natively), Android surfaces
+  /// no PiP enter/exit callback to the plugin, and the floating package's
+  /// status stream starts a 10ms timer it never cancels. We instead poll the
+  /// cheap one-shot [Floating.pipStatus] only while fullscreen — the only
+  /// state from which Android PiP can be entered — and tear it down otherwise.
+  /// Updating the state here lets the existing `_updateState` cascade hide the
+  /// Flutter subtitle overlay, suppress native captions, and emit the stream.
+  void _updateAndroidPipPolling(NativeVideoPlayerState state) {
+    if (kIsWeb || !Platform.isAndroid || !allowsPictureInPicture) {
+      return;
+    }
+    if (state.isFullScreen && _androidPipPollTimer == null) {
+      Future<void> checkPipStatus() async {
+        if (_isDisposed) {
+          return;
+        }
+        final bool inPip = (await _floating.pipStatus) == PiPStatus.enabled;
+        if (!_isDisposed && inPip != _state.isPipEnabled) {
+          _updateState(_state.copyWith(isPipEnabled: inPip));
+
+          if (!inPip) {
+            unawaited(_pauseIfPipDismissed());
+          }
+        }
+      }
+
+      _androidPipPollTimer = Timer.periodic(
+        const Duration(milliseconds: 150),
+        (_) => unawaited(checkPipStatus()),
+      );
+      // First check at t=0 — waiting a full tick leaves [isPipEnabled] stale
+      // exactly when lifecycle-transition pause decisions read it.
+      unawaited(checkPipStatus());
+    } else if (!state.isFullScreen && _androidPipPollTimer != null) {
+      _androidPipPollTimer!.cancel();
+      _androidPipPollTimer = null;
+      // Leaving fullscreen necessarily means leaving PiP; reset the flag.
+      if (_state.isPipEnabled) {
+        _updateState(_state.copyWith(isPipEnabled: false));
+      }
+    }
+  }
+
+  /// Pauses playback when the PiP window was dismissed with its close (X)
+  /// button. Dismissing stops the activity without bringing the app back to
+  /// the foreground, so without this the media session keeps playing audio in
+  /// the background. Expanding the PiP window back into the app also flips the
+  /// PiP flag off, but Flutter only reports `resumed` after the exit animation
+  /// finishes and the window regains focus — on many devices well after a
+  /// fixed short delay. So instead of sampling the lifecycle once, wait for
+  /// `resumed` and only pause when it never arrives.
+  Future<void> _pauseIfPipDismissed() async {
+    const Duration pollInterval = Duration(milliseconds: 100);
+    const Duration resumeTimeout = Duration(seconds: 2);
+
+    final Stopwatch stopwatch = Stopwatch()..start();
+    while (stopwatch.elapsed < resumeTimeout) {
+      if (_isDisposed || _state.isPipEnabled) {
+        return;
+      }
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        return;
+      }
+      await Future<void>.delayed(pollInterval);
+    }
+
+    if (_isDisposed || _state.isPipEnabled) {
+      return;
+    }
+
+    debugPrint('PiP window dismissed while app is backgrounded — pausing');
+    await pause();
+  }
+
+  /// Maps URL sources for Android's native sideloading; null on other
+  /// platforms or when there is nothing to attach.
+  List<Map<String, dynamic>>? _androidSidecarMaps(
+    List<NativeVideoPlayerSidecarSubtitle>? sources,
+  ) {
+    if (kIsWeb || !Platform.isAndroid || sources == null) {
+      return null;
+    }
+    final maps = [
+      for (final s in sources)
+        if (s.url != null) s.toMap(),
+    ];
+    return maps.isEmpty ? null : maps;
+  }
+
+  /// Notifies control listeners about a sidecar subtitle selection, matching
+  /// the event shape the native side emits for embedded tracks.
+  void _emitSubtitleChanged(NativeVideoPlayerSubtitleTrack track) {
+    final event = PlayerControlEvent(
+      state: PlayerControlState.subtitleTrackChanged,
+      data: track.toMap(),
+    );
+    for (final handler in _controlEventHandlers) {
+      handler(event);
+    }
+  }
+
+  /// Returns whether Picture-in-Picture is available on this device
+  /// Checks the actual device capabilities rather than just the platform
+  /// PiP is available on iOS 14+ and Android 8+ (if the device supports it)
+  /// For Android, also requires the video to be in fullscreen mode
+  /// Respects the allowsPictureInPicture setting
+  Future<bool> isPictureInPictureAvailable() async {
+    // Check if PiP is allowed by controller settings
+    if (!allowsPictureInPicture) {
+      return false;
+    }
+
+    // Use floating package for Android
+    if (!kIsWeb && Platform.isAndroid) {
+      // Only available when in fullscreen on Android
+      if (!_state.isFullScreen) {
+        return false;
+      }
+      return await _floating.isPipAvailable;
+    }
+
+    // Use method channel for iOS
+    if (_methodChannel == null) {
+      return false;
+    }
+    return await _methodChannel!.isPictureInPictureAvailable();
+  }
+
+  /// Calculates the aspect ratio for PiP based on video quality information
+  /// Returns a Rational representing the video aspect ratio, or 16:9 if unavailable
+  Rational _getPiPAspectRatio() {
+    // Try to get dimensions from the current quality
+    if (_state.qualities.isNotEmpty) {
+      // Look for quality with dimensions
+      for (final quality in _state.qualities) {
+        if (quality.width != null && quality.height != null) {
+          final width = quality.width!;
+          final height = quality.height!;
+          debugPrint(
+            'Using video aspect ratio for PiP: $width:$height (${width / height})',
+          );
+          return Rational(width, height);
+        }
+      }
+    }
+
+    // Default to 16:9 if we can't determine the aspect ratio
+    debugPrint('Using default 16:9 aspect ratio for PiP');
+    return Rational(16, 9);
+  }
+
+  /// Enables automatic PiP on Android when app goes to background
+  /// Only enabled when video is in fullscreen
+  Future<void> _enableAutomaticPiP() async {
+    if (!kIsWeb &&
+        Platform.isAndroid &&
+        canStartPictureInPictureAutomatically &&
+        _state.isFullScreen) {
+      try {
+        await _floating.enable(OnLeavePiP(aspectRatio: _getPiPAspectRatio()));
+        debugPrint('Automatic PiP enabled (fullscreen mode)');
+      } catch (e) {
+        debugPrint('Error enabling automatic PiP: $e');
+      }
+    }
+  }
+
+  /// Enters Picture-in-Picture mode immediately
+  /// Only works on iOS 14+ and Android 8+
+  /// For Android, only works when video is in fullscreen
+  Future<bool> enterPictureInPicture() async {
+    // Use floating package for Android
+    if (!kIsWeb && Platform.isAndroid) {
+      // Only allow PiP when in fullscreen
+      if (!_state.isFullScreen) {
+        debugPrint('PiP requires fullscreen mode on Android');
+        return false;
+      }
+
+      try {
+        // Emit event to hide overlay before entering PiP
+        _emitPipStartedEvent();
+
+        // Give overlay time to hide
+        await Future.delayed(const Duration(milliseconds: 200));
+
+        final status = await _floating.enable(
+          ImmediatePiP(aspectRatio: _getPiPAspectRatio()),
+        );
+        final bool entered = status == PiPStatus.enabled;
+        if (entered) {
+          // Reflect PiP immediately so the subtitle overlay hides without
+          // waiting for the next poll tick; the poll then tracks the exit.
+          _updateState(_state.copyWith(isPipEnabled: true));
+        }
+        return entered;
+      } catch (e) {
+        debugPrint('Error entering PiP: $e');
+        return false;
+      }
+    }
+
+    // iOS: PiP needs an on-screen AVPlayerLayer. A texture-rendered tile
+    // has none — swap it to a platform view first (same shared player and
+    // position, visually seamless); the tile stays a platform view after.
+    if (_primaryViewIsTexture) {
+      final swapped = await _requestSurfaceSwap();
+      if (!swapped) {
+        debugPrint(
+          'PiP unavailable: texture tile could not swap to a platform view',
+        );
+        return false;
+      }
+    }
+
+    // Use method channel for iOS
+    if (_methodChannel == null) {
+      return false;
+    }
+    return await _methodChannel!.enterPictureInPicture();
+  }
+
+  /// Exits Picture-in-Picture mode
+  /// Only works on iOS 14+ and Android 8+
+  Future<bool> exitPictureInPicture() async {
+    // Use floating package for Android
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        // Cancel any OnLeavePiP if it was enabled
+        _floating.cancelOnLeavePiP();
+        // Re-enable automatic PiP if it was originally configured and still in fullscreen
+        if (canStartPictureInPictureAutomatically && _state.isFullScreen) {
+          await _enableAutomaticPiP();
+        }
+        // The floating package doesn't have an explicit disable method
+        // PiP will exit when the activity returns to foreground
+        return true;
+      } catch (e) {
+        debugPrint('Error exiting PiP: $e');
+        return false;
+      }
+    }
+
+    // Use method channel for iOS
+    if (_methodChannel == null) {
+      return false;
+    }
+    final successfully = await _methodChannel!.exitPictureInPicture();
+
+    _emitCurrentState();
+
+    return successfully;
+  }
+
+  /// Enables automatic inline Picture-in-Picture mode
+  ///
+  /// When enabled, PiP will automatically start when the app goes to background
+  /// (iOS 14.2+) or when the user presses the home button (Android 8+).
+  ///
+  /// **Platform Support:**
+  /// - iOS: Requires iOS 14.2+ and video must be playing
+  /// - Android: Requires Android 8+ and video must be in fullscreen
+  ///
+  /// **Returns:**
+  /// A Future that completes with true if automatic PiP was successfully enabled
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// // Enable automatic inline PiP
+  /// final success = await controller.enableAutomaticInlinePip();
+  /// if (success) {
+  ///   print('Automatic PiP enabled');
+  /// }
+  /// ```
+  Future<bool> enableAutomaticInlinePip() async {
+    if (_methodChannel == null) {
+      return false;
+    }
+
+    try {
+      // Android: enable through floating package
+      if (!kIsWeb && Platform.isAndroid) {
+        // Only enable if in fullscreen
+        if (!_state.isFullScreen) {
+          debugPrint(
+            'Cannot enable automatic PiP on Android: video must be in fullscreen',
+          );
+          return false;
+        }
+        await _enableAutomaticPiP();
+        return true;
+      }
+
+      // iOS: enable through method channel
+      return await _methodChannel!.enableAutomaticInlinePip();
+    } catch (e) {
+      debugPrint('Error enabling automatic inline PiP: $e');
+      return false;
+    }
+  }
+
+  /// Disables automatic inline Picture-in-Picture mode
+  ///
+  /// When disabled, PiP will NOT automatically start when the app goes to background.
+  /// Manual PiP through [enterPictureInPicture] will still work.
+  ///
+  /// **Platform Support:**
+  /// - iOS: Requires iOS 14.2+
+  /// - Android: Requires Android 8+
+  ///
+  /// **Returns:**
+  /// A Future that completes with true if automatic PiP was successfully disabled
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// // Disable automatic inline PiP
+  /// final success = await controller.disableAutomaticInlinePip();
+  /// if (success) {
+  ///   print('Automatic PiP disabled');
+  /// }
+  /// ```
+  Future<bool> disableAutomaticInlinePip() async {
+    if (_methodChannel == null) {
+      return false;
+    }
+
+    try {
+      // Android: disable through floating package
+      if (!kIsWeb && Platform.isAndroid) {
+        _floating.cancelOnLeavePiP();
+        debugPrint('Automatic PiP disabled (Android)');
+        return true;
+      }
+
+      // iOS: disable through method channel
+      return await _methodChannel!.disableAutomaticInlinePip();
+    } catch (e) {
+      debugPrint('Error disabling automatic inline PiP: $e');
+      return false;
+    }
+  }
+
+  /// Toggles Picture-in-Picture mode
+  /// Only works on iOS 14+ and Android 8+
+  /// Returns true if the operation was successful
+  Future<bool> togglePictureInPicture() async {
+    if (_state.isPipEnabled) {
+      return await exitPictureInPicture();
+    } else {
+      return await enterPictureInPicture();
+    }
+  }
+
+  /// Enters fullscreen mode
+  /// Uses Dart fullscreen if custom overlay is present, otherwise uses native fullscreen
+  Future<void> enterFullScreen() async {
+    if (_state.isFullScreen) {
+      return;
+    }
+
+    _updateState(_state.copyWith(isFullScreen: true));
+
+    // Enable automatic PiP and refresh availability immediately after entering fullscreen on Android
+    // This ensures isPipAvailable is updated before the UI rebuilds
+    if (!kIsWeb && Platform.isAndroid) {
+      await _enableAutomaticPiP();
+      await _refreshAvailabilityFlags();
+    }
+
+    // Texture-rendered views have no native view to expand: always use the
+    // Dart fullscreen route for them, overlay or not.
+    if ((_hasCustomOverlay || _primaryViewIsTexture) &&
+        _fullscreenContext != null) {
+      _usedDartFullscreen = true;
+
+      // Emit fullscreen entered event
+      final controlEvent = PlayerControlEvent(
+        state: PlayerControlState.fullscreenEntered,
+        data: <String, dynamic>{'isFullscreen': true},
+      );
+      for (final handler in _controlEventHandlers) {
+        handler(controlEvent);
+      }
+
+      // Use Dart fullscreen when we have a custom overlay
+      await _enterDartFullscreen();
+    } else {
+      // Use native fullscreen when no custom overlay
+      await _methodChannel?.enterFullScreen();
+    }
+  }
+
+  /// Exits fullscreen mode
+  /// Handles both Dart and native fullscreen exit
+  Future<void> exitFullScreen() async {
+    if (!_state.isFullScreen) {
+      return;
+    }
+
+    _updateState(_state.copyWith(isFullScreen: false));
+
+    // Disable automatic PiP and refresh availability immediately after exiting fullscreen on Android
+    // This ensures isPipAvailable is updated before the UI rebuilds
+    if (!kIsWeb && Platform.isAndroid) {
+      _floating.cancelOnLeavePiP();
+      debugPrint('Automatic PiP disabled (exited fullscreen)');
+      await _refreshAvailabilityFlags();
+    }
+
+    if (_hasCustomOverlay || _usedDartFullscreen) {
+      _usedDartFullscreen = false;
+
+      // Dart fullscreen: use dedicated callback to close the dialog
+      _dartFullscreenCloseCallback?.call();
+
+      // Emit event for other listeners (but don't use it to close the dialog)
+      final controlEvent = PlayerControlEvent(
+        state: PlayerControlState.fullscreenExited,
+        data: <String, dynamic>{'isFullscreen': false},
+      );
+      for (final handler in _controlEventHandlers) {
+        handler(controlEvent);
+      }
+    } else {
+      // Use native fullscreen
+      await _methodChannel?.exitFullScreen();
+    }
+  }
+
+  /// Enters Dart-based fullscreen mode
+  Future<void> _enterDartFullscreen() async {
+    final context = _fullscreenContext;
+
+    if (context == null) {
+      // Fallback: reset state since we can't show fullscreen
+      _updateState(_state.copyWith(isFullScreen: false));
+      return;
+    }
+
+    await FullscreenManager.showFullscreenDialog(
+      context: context,
+      builder: (dialogContext) {
+        return FullscreenVideoPlayer(
+          controller: this,
+          overlayBuilder: _overlayBuilder,
+          subtitleStyle:
+              _subtitleStyle ?? const NativeVideoPlayerSubtitleStyle(),
+        );
+      },
+      lockToLandscape: lockToLandscape,
+      onExit: () {
+        // Update state when fullscreen dialog is dismissed by user (back button, etc.)
+        _dartFullscreenCloseCallback = null;
+        if (_state.isFullScreen) {
+          _updateState(_state.copyWith(isFullScreen: false));
+
+          // Mirror exitFullScreen(): leaving fullscreen must disarm the
+          // activity-global OnLeavePiP, otherwise auto-PiP stays armed for the
+          // rest of the session and any later app-leave enters PiP — even from
+          // inline playback or with no video playing at all.
+          if (!kIsWeb && Platform.isAndroid) {
+            _floating.cancelOnLeavePiP();
+            debugPrint('Automatic PiP disabled (fullscreen dialog dismissed)');
+            unawaited(_refreshAvailabilityFlags());
+          }
+        }
+      },
+    );
+  }
+
+  /// Toggles fullscreen mode
+  Future<void> toggleFullScreen() async {
+    if (_state.isFullScreen) {
+      await exitFullScreen();
+    } else {
+      await enterFullScreen();
+    }
+  }
+
+  /// Sets whether native player controls are shown
+  ///
+  /// This is useful when you want to use custom overlay controls instead of
+  /// the native player controls.
+  ///
+  /// **Parameters:**
+  /// - show: true to show native controls, false to hide them
+  Future<void> setShowNativeControls(bool show) async {
+    await _methodChannel?.setShowNativeControls(show);
+  }
+
+  /// Checks if AirPlay is available on the device
+  ///
+  /// This is only available on iOS. On Android, this always returns false.
+  /// Use this method to conditionally show/hide AirPlay buttons in your UI.
+  ///
+  /// **Returns:**
+  /// A Future that resolves to true if AirPlay is available, false otherwise
+  Future<bool> isAirPlayAvailable() async {
+    if (_methodChannel == null) {
+      return false;
+    }
+    return await _methodChannel!.isAirPlayAvailable();
+  }
+
+  /// Shows the AirPlay route picker for selecting AirPlay devices
+  ///
+  /// This is only available on iOS. On Android, this method does nothing.
+  /// Displays the native iOS AirPlay picker UI to allow users to select
+  /// an AirPlay device for video output.
+  ///
+  /// **Returns:**
+  /// A Future that completes when the picker is shown (or immediately on Android)
+  Future<void> showAirPlayPicker() async {
+    if (_methodChannel == null) {
+      return;
+    }
+    await _methodChannel!.showAirPlayPicker();
+  }
+
+  /// Disconnects from the currently connected AirPlay device (iOS only)
+  ///
+  /// This method stops sending video to the AirPlay device. The user can
+  /// reconnect to AirPlay later using the AirPlay picker.
+  ///
+  /// Throws a [PlatformException] if:
+  /// - Not currently connected to AirPlay
+  /// - Player is not initialized
+  ///
+  /// Example:
+  /// ```dart
+  /// if (controller.isAirplayConnected) {
+  ///   await controller.disconnectAirPlay();
+  /// }
+  /// ```
+  Future<void> disconnectAirPlay() async {
+    if (_methodChannel == null) {
+      throw StateError('Player not initialized');
+    }
+    await _methodChannel!.disconnectAirPlay();
+  }
+
+  /// Locks the custom overlay to be always visible
+  ///
+  /// When the overlay is locked, it cannot be dismissed by tapping or by auto-hide timer.
+  /// This is useful when you want to keep controls always visible, such as during
+  /// live streams, interactive content, or when the user needs constant access to controls.
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// // Lock overlay to always be visible
+  /// controller.lockOverlay();
+  /// ```
+  ///
+  /// To unlock the overlay and restore normal behavior, call [unlockOverlay].
+  void lockOverlay() {
+    _isOverlayLocked = true;
+    if (!_isOverlayLockedController.isClosed) {
+      _isOverlayLockedController.add(true);
+    }
+  }
+
+  /// Unlocks the custom overlay to allow it to be dismissed
+  ///
+  /// When the overlay is unlocked, it can be dismissed by tapping or will auto-hide
+  /// after a period of inactivity (default 3 seconds).
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// // Unlock overlay to allow normal tap-to-hide behavior
+  /// controller.unlockOverlay();
+  /// ```
+  ///
+  /// To lock the overlay again and keep it always visible, call [lockOverlay].
+  void unlockOverlay() {
+    _isOverlayLocked = false;
+    if (!_isOverlayLockedController.isClosed) {
+      _isOverlayLockedController.add(false);
+    }
+  }
+
+  /// Releases Flutter-side resources while keeping the native player alive
+  ///
+  /// Use this when navigating away from a screen but want to keep the video
+  /// loaded and resume playback when returning. This pauses the video and
+  /// cleans up Flutter resources (subscriptions, listeners, contexts) but
+  /// does NOT dispose the native player.
+  ///
+  /// Perfect for:
+  /// - Navigating between list and detail screens with the same video
+  /// - Temporarily hiding a video player while keeping it loaded
+  /// - Memory optimization without losing playback position
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// @override
+  /// void dispose() {
+  ///   // Release Flutter resources but keep native player alive
+  ///   _controller.releaseResources();
+  ///   super.dispose();
+  /// }
+  /// ```
+  Future<void> releaseResources() async {
+    // Pause playback
+    await pause();
+
+    // Exit fullscreen if active
+    if (_state.isFullScreen) {
+      await exitFullScreen();
+    }
+
+    // Cancel all event channel subscriptions
+    // Create a snapshot to avoid concurrent modification during iteration
+    final subscriptions = _eventSubscriptions.values.toList();
+    for (final StreamSubscription<dynamic> subscription in subscriptions) {
+      await _safeCancelSubscription(subscription);
+    }
+    _eventSubscriptions.clear();
+
+    // Cancel PiP event subscription (Android only)
+    await _safeCancelSubscription(_pipEventSubscription);
+    _pipEventSubscription = null;
+
+    // NOTE: Do NOT cancel _controllerEventSubscription here
+    // The controller-level event channel persists to receive PiP/AirPlay events
+    // even when all platform views are disposed. It's only cancelled in dispose().
+
+    // Cancel buffering debounce timer
+    _bufferingDebounceTimer?.cancel();
+    _bufferingDebounceTimer = null;
+
+    // Cancel the stalled-playback watchdogs — the handlers they would
+    // notify are cleared below, and the native player is paused anyway.
+    _cancelWatchdogs();
+
+    // Clear all event handlers
+    _activityEventHandlers.clear();
+    _controlEventHandlers.clear();
+    _airPlayAvailabilityHandlers.clear();
+    _airPlayConnectionHandlers.clear();
+
+    // Clear platform view references
+    _platformViewIds.clear();
+    _platformViewContexts.clear();
+    _primaryPlatformViewId = null;
+
+    // Clear method channel reference (but don't dispose native player)
+    if (advertisementController.isEnabled && _methodChannel != null) {
+      await _methodChannel!.destroyAdvertisement();
+    }
+    advertisementController._detachPlatform();
+    _methodChannel = null;
+    _initializeCompleter = null;
+
+    // Clear fullscreen callback (but keep overlay builder)
+    _dartFullscreenCloseCallback = null;
+
+    // Note: We do NOT clear _overlayBuilder so it persists across releases
+    // The widget will call setOverlayBuilder() again when reconnecting
+    // Note: We do NOT clear _state and _url so we can resume playback
+    // Note: We do NOT call _methodChannel.dispose() to keep native player alive
+    // Note: We do NOT close stream controllers so they can continue to be used
+  }
+
+  /// Fully disposes of all resources including the native player
+  ///
+  /// Should be called when the video player is no longer needed and will not
+  /// be reused. This completely destroys both Flutter and native resources.
+  ///
+  /// For temporary cleanup while keeping the player alive, use [releaseResources] instead.
+  ///
+  /// **Usage:**
+  /// ```dart
+  /// @override
+  /// void dispose() {
+  ///   // Fully dispose when done with the controller
+  ///   _controller.dispose();
+  ///   super.dispose();
+  /// }
+  /// ```
+  Future<void> dispose() async {
+    // Prevent double disposal
+    if (_isDisposed) {
+      return;
+    }
+
+    // Mark as disposed immediately to prevent new events from being added
+    _isDisposed = true;
+
+    // Stop the Android PiP status poll.
+    _androidPipPollTimer?.cancel();
+    _androidPipPollTimer = null;
+
+    // Stop the stalled-playback watchdogs.
+    _cancelWatchdogs();
+
+    // Remove from the playback coordinator (cap enforcement)
+    PlaybackCoordinator.instance.unregister(_playableHandle);
+
+    // Stop sidecar subtitle rendering/timers
+    _sidecarSubtitles.dispose();
+
+    // Release native ad resources before disposing the content player. The
+    // ad bridge may still own an overlay/player while an ad is active.
+    if (advertisementController.isEnabled && _methodChannel != null) {
+      await _methodChannel!.destroyAdvertisement();
+    }
+
+    // Close the optional advertising streams before the content-controller
+    // streams. This is Dart-only state management and never issues a native
+    // command.
+    await advertisementController.dispose();
+
+    // Wait for any in-flight controller-channel setup so it cannot subscribe
+    // after teardown (its retries abort early now that _isDisposed is set).
+    try {
+      await _controllerChannelSetupFuture;
+    } catch (e) {
+      debugPrint('Controller channel setup failed during dispose: $e');
+    }
+
+    // Pause playback first to avoid crashes during disposal
+    if (_state.activityState.isPlaying) {
+      await pause();
+      // Give the native side a moment to process the pause
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+
+    // Exit fullscreen if active
+    if (_state.isFullScreen) {
+      await exitFullScreen();
+    }
+
+    // Cancel all event channel subscriptions BEFORE closing stream controllers
+    // This prevents new events from coming in while we're closing
+    // Create a snapshot to avoid concurrent modification during iteration
+    final subscriptions = _eventSubscriptions.values.toList();
+    for (final StreamSubscription<dynamic> subscription in subscriptions) {
+      await _safeCancelSubscription(subscription);
+    }
+    _eventSubscriptions.clear();
+
+    // Cancel PiP event subscription (Android only)
+    await _safeCancelSubscription(_pipEventSubscription);
+    _pipEventSubscription = null;
+
+    // Cancel controller-level event subscription
+    await _safeCancelSubscription(_controllerEventSubscription);
+    _controllerEventSubscription = null;
+
+    // Cancel buffering debounce timer
+    _bufferingDebounceTimer?.cancel();
+    _bufferingDebounceTimer = null;
+
+    // Clear all event handlers
+    _activityEventHandlers.clear();
+    _controlEventHandlers.clear();
+    _airPlayAvailabilityHandlers.clear();
+    _airPlayConnectionHandlers.clear();
+
+    // Unregister method channel from AirPlay manager
+    if (_methodChannel != null) {
+      AirPlayStateManager.instance.unregisterMethodChannel(_methodChannel!);
+    }
+
+    // Teardown controller-level event channel on native side. This runs
+    // AFTER the subscription cancel above (so Dart's `cancel` hits a live
+    // handler) and BEFORE the native player disposal below (so no event can
+    // be emitted into a torn-down channel). Awaited so a recreate with the
+    // same controller ID starts from a clean slate.
+    try {
+      await _pluginMethodChannel.invokeMethod<void>(
+        'teardownControllerEventChannel',
+        {'controllerId': id},
+      );
+    } catch (e) {
+      debugPrint('Failed to teardown controller event channel: $e');
+    }
+
+    // Dispose native player resources (removes shared player from manager).
+    if (_methodChannel != null) {
+      await _methodChannel?.dispose();
+    }
+
+    // ALWAYS release by controller ID as the authoritative cleanup: the
+    // view-routed dispose above races platform-view teardown when a feed
+    // tile is unmounted (the call lands after the view unregistered →
+    // NO_VIEW → silently dropped), which leaked one native player per
+    // disposed controller until the OS killed the app (observed as an OOM
+    // on a Galaxy S21 after a few six-player feed visits). disposeController
+    // needs no view, and native removePlayer is idempotent on both
+    // platforms, so running it after a successful view dispose is harmless.
+    try {
+      await _pluginMethodChannel.invokeMethod<void>('disposeController', {
+        'controllerId': id,
+      });
+    } catch (e) {
+      debugPrint('Failed to dispose native player for controller $id: $e');
+    }
+
+    // Close all stream controllers
+    await _bufferedPositionController.close();
+    await _durationController.close();
+    await _playerStateController.close();
+    await _positionController.close();
+    await _speedController.close();
+    await _isPipEnabledController.close();
+    await _isPipAvailableController.close();
+    // Note: AirPlay stream controllers are managed by the global AirPlayStateManager
+    await _isFullscreenController.close();
+    await _qualityChangedController.close();
+    await _qualitiesController.close();
+    await _isOverlayLockedController.close();
+    await _videoSizeController.close();
+    await _surfaceSwapRequests.close();
+
+    // Clear platform view references
+    _platformViewIds.clear();
+    _platformViewContexts.clear();
+    _textureViewIds.clear();
+    _primaryPlatformViewId = null;
+
+    // Clear overlay and fullscreen references
+    _overlayBuilder = null;
+    _dartFullscreenCloseCallback = null;
+
+    // Clear other state
+    _methodChannel = null;
+    _url = null;
+    _lastAdConfiguration = null;
+    _initializeCompleter = null;
+  }
+
+  /// Internal method to emit pipStarted event (hides overlay before PiP)
+  void _emitPipStartedEvent() {
+    final controlEvent = PlayerControlEvent(
+      state: PlayerControlState.pipStarted,
+      data: <String, dynamic>{},
+    );
+    for (final handler in _controlEventHandlers) {
+      handler(controlEvent);
+    }
+  }
+}
+
+/// Adapter exposing a controller to the [PlaybackCoordinator] without
+/// widening the controller's public API.
+class _ControllerPlayableHandle implements PlayableHandle {
+  _ControllerPlayableHandle(this.controller);
+
+  final NativeVideoPlayerController controller;
+
+  @override
+  int get id => controller.id;
+
+  @override
+  bool get isPipActive => controller._state.isPipEnabled;
+
+  @override
+  bool get isAirPlayConnected => controller._state.isAirplayConnected;
+
+  @override
+  Future<void> pauseForCap() => controller.pause();
+}
+
+/// App lifecycle observer to hide overlay before automatic PiP on Android
+class _AppLifecycleObserver with WidgetsBindingObserver {
+  _AppLifecycleObserver(this.controller);
+
+  final NativeVideoPlayerController controller;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // When app goes to background and we're in fullscreen with automatic PiP enabled,
+    // hide the overlay before Android captures the screen for PiP
+    if (state == AppLifecycleState.inactive &&
+        controller._state.isFullScreen &&
+        controller.canStartPictureInPictureAutomatically) {
+      controller._emitPipStartedEvent();
+    }
+
+    // When app returns to foreground (after exiting PiP),
+    // re-enable automatic PiP if still in fullscreen
+    if (state == AppLifecycleState.resumed &&
+        controller._state.isFullScreen &&
+        controller.canStartPictureInPictureAutomatically) {
+      controller._enableAutomaticPiP();
+    }
+  }
+}
