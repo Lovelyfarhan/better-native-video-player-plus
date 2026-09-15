@@ -1,8 +1,64 @@
 # better_native_video_player_plus
-
 [![pub package](https://img.shields.io/pub/v/better_native_video_player.svg)](https://pub.dev/packages/better_native_video_player)
 
 A Flutter plugin for native video playback on iOS and Android with advanced features.
+
+## 🆕 What's New — In-Video Advertisements (VAST / VMAP via Google IMA)
+
+The plugin now supports **in-video advertisements** on iOS and Android through the
+official **Google IMA** SDK. You can play **pre-roll, mid-roll, post-roll**, and
+**VMAP-scheduled** ad breaks with normalized Dart events, full skip handling, ad
+pods, and automatic content resume — all without changing the existing content
+player API.
+
+- ✅ **Pre-roll / mid-roll / post-roll / multiple mid-rolls** via a typed `adBreaks` schedule
+- ✅ **VAST** and **VMAP** tags, with the schedule owned by IMA for VMAP
+- ✅ **Google IMA** on both platforms: native Media3 IMA on Android, official IMA CocoaPod on iOS
+- ✅ **Normalized ad events** (request, ready, started, quartiles, pause/resume, skip, click, complete, break, all-ads-completed, error)
+- ✅ **Ad pods** (`adPositionInPod` / `totalAdsInPod`) and **skip** behavior (`isSkippable`, `skipTimeOffset`)
+- ✅ **Error-safe by default** — a failed ad resumes content and releases native ad resources
+- ✅ **Optional** — a controller without `adConfiguration` behaves exactly like an ordinary content player
+**Advertisements are strictly opt-in.** Passing `adConfiguration` to `load()` /
+`loadUrl()` enables them; omitting it never changes content playback.
+
+> ⚠️ **Before you start:** read [Getting Ads Working Without Errors](#getting-ads-working-without-errors)
+> for the platform setup, the supported/unsupported combinations, and the most
+> common failure causes. Ads run on **Android API 24+** and **iOS 12+** only.
+
+Jump straight to the full [Advertisement Support](#advertisement-support) section
+for the complete API, or copy one of these ready-to-use snippets:
+
+```dart
+// Pre-roll (VAST) — plays an ad before the content.
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+    adTagUrl: Uri.parse('https://ads.example.com/pre-roll-vast.xml'),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+    ],
+  ),
+);
+```
+
+```dart
+// VMAP — Google IMA owns the whole pre/mid/post-roll schedule.
+await controller.loadUrl(
+  url: 'https://example.com/episode.m3u8',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vmap(
+    adTagUrl: Uri.parse('https://ads.example.com/schedule-vmap.xml'),
+  ),
+);
+```
+
+```dart
+// React to every ad event through the controller-scoped stream.
+final sub = controller.advertisementController.events.listen((event) {
+  if (event.type == NativeVideoPlayerAdEventType.error) {
+    print('ad error: ${event.error?.code}');
+  }
+});
+```
 
 ## Features
 
@@ -15,6 +71,7 @@ A Flutter plugin for native video playback on iOS and Android with advanced feat
 - ✅ **Picture-in-Picture (PiP)** mode on both platforms with automatic state management
 - ✅ **AirPlay** support on iOS with availability detection and connection events
 - ✅ Native **fullscreen** playback with Dart-side fullscreen option
+- ✅ **In-Video Ads (IN-Ads)** 🆕: pre-roll, mid-roll, post-roll and VMAP schedules via Google IMA (VAST/VMAP) with normalized events, ad pods, skip handling, and error-safe content resume — [see full guide](#advertisement-support)
 - ✅ **Custom overlay controls** - Build your own UI on top of native player
 - ✅ **Now Playing** integration (Control Center on iOS, lock screen notifications on Android)
 - ✅ Background playback with media notifications
@@ -103,11 +160,60 @@ await controller.load(url: 'file:///path/to/video.mp4');
 **Note**: Quality selection and adaptive streaming are only available for HLS streams. Other formats play at their native quality.
 
 ## Advertisement Support
-
 Advertisements are optional. A controller without `adConfiguration` behaves as
 an ordinary content player.
 
+Advertising is provided by the **Google IMA** SDK:
+
+- **Android** — the official Google IMA client-side SDK on top of **Media3 ExoPlayer** (platform-view mode).
+- **iOS** — the official `GoogleAds-IMA-iOS-SDK` CocoaPod on top of **AVPlayer**.
+
+You describe *what to play* with a provider-neutral Dart configuration
+(`NativeVideoPlayerAdConfiguration`), and the native IMA adapter requests the
+VAST/VMAP tag, selects media, reports tracking events, and (for VMAP) owns the
+schedule. **No VAST or VMAP document is ever parsed in Dart.**
+
+### Ad Placements at a Glance
+| Placement | How to configure | When it plays |
+|-----------|------------------|---------------|
+| **Pre-roll** | `NativeVideoPlayerAdBreak.preRoll(id: ...)` | Before content starts |
+| **Mid-roll** | `NativeVideoPlayerAdBreak.midRoll(id: ..., position: ...)` | At a content position |
+| **Post-roll** | `NativeVideoPlayerAdBreak.postRoll(id: ...)` | After content completes |
+| **VMAP schedule** | `NativeVideoPlayerAdConfiguration.vmap(...)` | Whatever the VMAP response defines |
+
+### Quick Start — Pre-roll in Three Steps
+```dart
+// 1. Create the controller as usual.
+final controller = NativeVideoPlayerController(id: 1, autoPlay: true);
+await controller.initialize();
+
+// 2. Listen for ad events (optional but recommended).
+controller.advertisementController.events.listen((event) {
+  print('ad event: ${event.type}');
+});
+
+// 3. Load content with an ad configuration.
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+    adTagUrl: Uri.parse('https://ads.example.com/pre-roll-vast.xml'),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+    ],
+  ),
+);
+```
+
+That is the minimum needed for a working pre-roll. Everything below is optional
+tuning, or the full reference for the other placements.
+
+**Order matters:** create the controller, call `initialize()`, subscribe to the
+ad streams, and then call `load(...)` with the `adConfiguration`. The ad
+configuration is stored on the controller for the duration of that content load,
+so a later `load()` without `adConfiguration` disables ads for the new item.
+
 ### Normal Video Without Ads
+Omitting `adConfiguration` is the default and requires no other change:
 
 ```dart
 final controller = NativeVideoPlayerController(id: 1, autoPlay: true);
@@ -115,6 +221,9 @@ await controller.loadUrl(
   url: 'https://example.com/video.m3u8',
 );
 ```
+
+`controller.advertisementController.isEnabled` stays `false` and no advertising
+platform commands are sent.
 
 ### Pre-roll
 
@@ -166,14 +275,27 @@ await controller.loadUrl(
 ```
 
 ### VAST
-
 Use `NativeVideoPlayerAdConfiguration.vast` with a VAST tag URL. Google IMA
 handles wrappers, redirects, media selection, tracking, click-through, skip
 offsets, quartile events, pods, and errors. VAST documents are not parsed in
 Dart.
 
-### VMAP
+```dart
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+    adTagUrl: Uri.parse('https://ads.example.com/tag.xml'),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+    ],
+  ),
+);
+```
 
+A VAST response typically describes **one break**. To place ads at several
+positions, add one `adBreaks` entry (or use VMAP instead — see below).
+
+### VMAP
 ```dart
 await controller.loadUrl(
   url: 'https://example.com/episode.m3u8',
@@ -185,6 +307,16 @@ await controller.loadUrl(
 
 For VMAP, Google IMA owns the complete pre-roll, mid-roll, post-roll, and
 multiple-break schedule. Manual `adBreaks` are ignored when `tagType` is VMAP.
+
+### Selecting Between VAST and VMAP
+| You want to… | Use | Who controls placement |
+|--------------|-----|------------------------|
+| Place a break at a position **you** choose in Dart | `...vast(...)` + `adBreaks` | Your `adBreaks` list |
+| Let the ad server define the whole schedule | `...vmap(...)` | The VMAP response (IMA) |
+| Single simple pre-roll | `...vast(...)` + one `preRoll` | Your `adBreaks` list |
+
+If you are unsure, start with **VAST + a pre-roll**: it is the smallest moving
+part and exercises the same native path as the other placements.
 
 ### Ad Events
 
@@ -375,6 +507,299 @@ iOS uses the official `GoogleAds-IMA-iOS-SDK` CocoaPod through the plugin
 podspec. The minimum deployment target is iOS 12.0. IMA uses a native overlay
 over the existing AVPlayer content surface; no custom VAST or VMAP parser is
 used. Run `pod install` from the example iOS project on macOS before building.
+
+### Getting Ads Working Without Errors
+Follow these rules to avoid the common failure modes. Every item here maps to a
+concrete cause seen in real integrations.
+
+#### 1. Use the correct call order
+```dart
+final controller = NativeVideoPlayerController(id: 1);
+await controller.initialize();          // 1. initialize first
+controller.advertisementController     // 2. subscribe before load,
+    .events.listen(_onAdEvent);         //    otherwise you miss startup events
+await controller.loadUrl(               // 3. then load with a configuration
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+    adTagUrl: Uri.parse('https://ads.example.com/tag.xml'),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+    ],
+  ),
+);
+```
+
+- Loading **before** `initialize()` throws `Controller not initialized`.
+- Subscribing **after** `load()` can miss `requestStarted` / `breakReady`.
+
+#### 2. Give every break a stable, unique `id`
+
+A mid-roll that has already played is **not replayed** when the user seeks back
+during the same load (identified by its `id`). Reusing the same `id` for two
+different breaks collapses them into one:
+
+```dart
+// ✅ Unique, stable ids
+NativeVideoPlayerAdBreak.midRoll(id: 'break-10m', position: const Duration(minutes: 10)),
+NativeVideoPlayerAdBreak.midRoll(id: 'break-20m', position: const Duration(minutes: 20)),
+
+// ❌ Two different positions, same id — treated as one break
+NativeVideoPlayerAdBreak.midRoll(id: 'ad', position: const Duration(minutes: 10)),
+NativeVideoPlayerAdBreak.midRoll(id: 'ad', position: const Duration(minutes: 20)),
+```
+
+A new `load(...)` (or `load(..., force: true)`) starts a fresh ad session, so
+breaks become eligible again on a genuine reload.
+
+#### 3. A mid-roll requires a `position`; pre/post-roll must not have one
+`NativeVideoPlayerAdBreak` asserts this. Using the named constructors correctly
+already guarantees it, but constructing the raw class directly does not:
+
+```dart
+// ✅ Named constructors are always valid
+NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+NativeVideoPlayerAdBreak.midRoll(id: 'mid', position: const Duration(minutes: 5)),
+NativeVideoPlayerAdBreak.postRoll(id: 'post'),
+```
+
+#### 4. Mid-rolls can only fire if the platform knows the duration
+A mid-roll at `10:00` cannot be scheduled until the content duration is known.
+For **HLS**, the duration arrives after the manifest is parsed; for a **live**
+stream there is no fixed duration, so position-based mid-rolls do not apply.
+Prefer **VMAP** or **pre/post-roll** for live content.
+
+#### 5. Do not combine VMAP with a manual schedule
+When `tagType` is VMAP, the VMAP response is authoritative and manual `adBreaks`
+are ignored. Pass either a manual schedule (VAST) **or** VMAP — not both, and not
+with the expectation that the manual list still applies.
+
+#### 6. Keep `adConfiguration` off unsupported surfaces
+Native IMA ad UI is only available on **Android API 24+** and **iOS 12+** in
+**platform-view mode**. Ads are not available on Web/WASM, desktop
+(Windows/macOS/Linux), or when the inline tile is rendered in **texture mode**.
+In texture mode the ad reports an unsupported-ad error. If you rely on ads for a
+particular tile, keep that tile in platform-view mode:
+
+```dart
+// ❌ Ads + texture mode on the same tile → unsupported-ad error
+NativeVideoPlayerConfig.global = const NativeVideoPlayerConfig(
+  androidTextureMode: true,
+  iosTextureMode: true,
+);
+```
+
+#### 7. Expect and handle failures gracefully
+
+The default behavior already protects content playback: a failed ad request or
+break **resumes content** and releases native ad resources. This is the safe
+default for production — leave it on unless you need a custom recovery flow:
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+  adTagUrl: Uri.parse('https://ads.example.com/tag.xml'),
+  resumeContentOnError: true, // default — content keeps playing if the ad fails
+),
+```
+
+Always subscribe to the `errors` stream so failures are visible rather than
+silent:
+
+```dart
+controller.advertisementController.errors.listen((error) {
+  // error.code / error.message are safe to log; error.details may be provider-specific
+  debugPrint('ad failed [${error.code}]: ${error.message}');
+});
+```
+
+#### 8. Test against a real ad tag on a physical device
+Ad serving depends on the network and the ad server, not just your app. When
+an ad does not appear, in this order check: the tag URL is reachable and
+returns a valid VAST/VMAP response; the device has network access; the content
+itself loads without ads (proves the content path is fine); then the ad events
+— a `requestStarted` with no `breakReady` means the server returned no ad.
+
+#### Common Ad Problems and Fixes
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| No ad events at all | Subscribed after `load()`, or no `adConfiguration` | Subscribe before `load()`; pass a configuration |
+| `Controller not initialized` | `load()` called before `initialize()` | Await `initialize()` first |
+| Mid-roll never plays | Duration unknown (live) or position beyond content length | Use VMAP/pre-roll, or a position within the content |
+| Same break plays twice | Two breaks share an `id` | Give each break a unique `id` |
+| Unsupported-ad error | Texture mode, Web/WASM, or desktop | Use platform-view mode on Android/iOS |
+| Ad plays, then content never resumes | `resumeContentOnError: false` and no recovery | Set it back to `true`, or handle the failed state |
+| Content pauses with no ad visible | Ad requested but server returned no creative | Handle `error`/`breakCompleted`; content resumes by default |
+| Manual `adBreaks` ignored | Configured with VMAP | VMAP owns the schedule — remove manual breaks or switch to VAST |
+
+### Advertisement API Reference
+#### `NativeVideoPlayerAdConfiguration`
+Create it with `NativeVideoPlayerAdConfiguration.vast(...)` or
+`NativeVideoPlayerAdConfiguration.vmap(...)` (both forward to the base
+constructor with the matching `tagType`).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `adTagUrl` | `Uri` | required | VAST or VMAP tag URL |
+| `tagType` | `NativeVideoPlayerAdTagType` | `auto` (via `vast`/`vmap`) | Tag format: `auto`, `vast`, or `vmap` |
+| `enabled` | `bool` | `true` | Whether advertising participates in this load |
+| `adBreaks` | `List<NativeVideoPlayerAdBreak>` | `const []` | Manual pre/mid/post-roll schedule (ignored for VMAP) |
+| `timeout` | `Duration?` | `null` | Optional native ad request timeout |
+| `skipConfiguration` | `NativeVideoPlayerAdSkipConfiguration?` | `null` | Default skip policy for configured breaks |
+| `requestMetadata` | `NativeVideoPlayerAdRequestMetadata?` | `null` | Content context sent with the request |
+| `resumeContentOnError` | `bool` | `true` | Resume content automatically after an ad failure |
+
+Convenience getters: `preRollBreaks`, `midRollBreaks`, `postRollBreaks`.
+
+#### `NativeVideoPlayerAdBreak`
+Built via `preRoll(...)`, `midRoll(...)`, or `postRoll(...)`, or directly with an
+explicit `type`.
+
+| Parameter | Type | Required for | Description |
+|-----------|------|--------------|-------------|
+| `id` | `String` | all | Stable app-defined break identifier (must be non-empty) |
+| `type` | `NativeVideoPlayerAdBreakType` | base constructor | `preRoll`, `midRoll`, or `postRoll` |
+| `position` | `Duration?` | `midRoll` only | Content position for a mid-roll |
+| `adTagUrl` | `Uri?` | optional | Per-break tag URL overriding the configuration-level tag |
+| `skipConfiguration` | `NativeVideoPlayerAdSkipConfiguration?` | optional | Per-break skip policy override |
+
+#### Other Ad Types
+| Type | Purpose |
+|------|---------|
+| `NativeVideoPlayerAdTagType` | `auto`, `vast`, `vmap` |
+| `NativeVideoPlayerAdBreakType` | `preRoll`, `midRoll`, `postRoll` |
+| `NativeVideoPlayerAdSkipConfiguration` | App-level skip gate: `allowUserSkip`, `skipAfter` |
+| `NativeVideoPlayerAdRequestMetadata` | Request context: `contentId`, `contentTitle`, `contentUrl`, `customParameters` |
+| `NativeVideoPlayerAdMetadata` | Served ad info: `adId`, `creativeId`, `adSystem`, `title`, `advertiserName`, `clickThroughUrl`, `duration`, `isSkippable`, `skipTimeOffset` |
+| `NativeVideoPlayerAdError` | `code`, `message`, `details` |
+| `NativeVideoPlayerAdEvent` | Normalized event (see below) |
+| `NativeVideoPlayerAdEventType` | The event enum (see below) |
+| `NativeVideoPlayerAdPlaybackState` | Ad playback state |
+| `NativeVideoPlayerAdSessionState` | Content/ad orchestration phase |
+
+#### `NativeVideoPlayerAdEventType` Values
+`requestStarted`, `breakReady`, `breakStarted`, `adStarted`, `adProgress`,
+`firstQuartile`, `midpoint`, `thirdQuartile`, `adPaused`, `adResumed`,
+`adSkipped`, `adCompleted`, `breakCompleted`, `allAdsCompleted`, `clicked`,
+`error`, `unknown`.
+
+#### `NativeVideoPlayerAdEvent` Fields
+`type`, `rawType`, `adBreak`, `adBreakId`, `metadata`, `position`, `duration`,
+`adPositionInPod`, `totalAdsInPod`, `error`, `timestamp` (UTC),
+`contentId`, `contentTitle`, `contentUrl`.
+
+#### `controller.advertisementController` Members
+| Member | Type | Description |
+|--------|------|-------------|
+| `configuration` | `NativeVideoPlayerAdConfiguration?` | Configuration for the current load |
+| `isEnabled` | `bool` | Whether advertising is configured |
+| `state` | `NativeVideoPlayerAdPlaybackState` | Current ad playback state |
+| `sessionState` | `NativeVideoPlayerAdSessionState` | Current content/ad phase |
+| `contentActivityState` | `PlayerActivityState` | Latest content activity state |
+| `currentBreak` | `NativeVideoPlayerAdBreak?` | Break currently being prepared or played |
+| `lastError` | `NativeVideoPlayerAdError?` | Most recent normalized error |
+| `lastEvent` | `NativeVideoPlayerAdEvent?` | Most recent normalized event |
+| `events` | `Stream<NativeVideoPlayerAdEvent>` | Normalized ad events |
+| `errors` | `Stream<NativeVideoPlayerAdError>` | Structured ad errors |
+| `stateStream` | `Stream<NativeVideoPlayerAdPlaybackState>` | Ad playback state changes |
+| `sessionStateStream` | `Stream<NativeVideoPlayerAdSessionState>` | Session phase changes |
+| `skipAdvertisement()` | `Future<void>` | Request a skip when IMA permits it |
+
+### Complete Example — Player with Ads, Events, and Skip Handling
+```dart
+import 'package:flutter/material.dart';
+import 'package:better_native_video_player_plus/better_native_video_player_plus.dart';
+
+class AdVideoPage extends StatefulWidget {
+  const AdVideoPage({super.key});
+
+  @override
+  State<AdVideoPage> createState() => _AdVideoPageState();
+}
+
+class _AdVideoPageState extends State<AdVideoPage> {
+  late final NativeVideoPlayerController _controller;
+  StreamSubscription<NativeVideoPlayerAdEvent>? _adSub;
+  StreamSubscription<NativeVideoPlayerAdError>? _errorSub;
+  String _adStatus = 'content';
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = NativeVideoPlayerController(id: 7, autoPlay: true);
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    await _controller.initialize();
+
+    final ads = _controller.advertisementController;
+
+    // Subscribe BEFORE load so no startup event is missed.
+    _adSub = ads.events.listen((event) {
+      if (!mounted) return;
+      setState(() => _adStatus = event.type.name);
+      switch (event.type) {
+        case NativeVideoPlayerAdEventType.adStarted:
+          debugPrint('ad started: ${event.metadata?.title}');
+        case NativeVideoPlayerAdEventType.adProgress:
+          debugPrint('ad ${event.position} / ${event.duration}');
+        case NativeVideoPlayerAdEventType.adSkipped:
+          debugPrint('ad skipped');
+        case NativeVideoPlayerAdEventType.allAdsCompleted:
+          debugPrint('all ads complete — content resumes');
+        default:
+          break;
+      }
+    });
+
+    _errorSub = ads.errors.listen((error) {
+      debugPrint('ad failed [${error.code}]: ${error.message}');
+    });
+
+    await _controller.loadUrl(
+      url: 'https://example.com/episode.m3u8',
+      adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+        adTagUrl: Uri.parse('https://ads.example.com/episode.xml'),
+        adBreaks: const <NativeVideoPlayerAdBreak>[
+          NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+          NativeVideoPlayerAdBreak.midRoll(
+            id: 'mid-10m',
+            position: Duration(minutes: 10),
+          ),
+          NativeVideoPlayerAdBreak.postRoll(id: 'post'),
+        ],
+        // Content keeps playing if the ad request fails (default).
+        resumeContentOnError: true,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _adSub?.cancel();
+    _errorSub?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Ads: $_adStatus')),
+      body: Column(
+        children: [
+          NativeVideoPlayer(controller: _controller),
+          // Optional app-level skip button — only effective for skippable ads.
+          TextButton(
+            onPressed: () =>
+                _controller.advertisementController.skipAdvertisement(),
+            child: const Text('Skip Ad (if skippable)'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+```
 
 ## DRM Support
 
@@ -1991,8 +2416,22 @@ NativeVideoPlayer(
 | `PlayerControlState.subtitleTrackChanged` | Subtitle track changed |
 | `PlayerControlState.audioTrackChanged` | Audio track changed |
 
-### Companion Helpers
+### Advertisement API
+| Type | Purpose |
+|------|---------|
+| `NativeVideoPlayerAdConfiguration` | Per-load ad setup: tag URL, `tagType` (`vast`/`vmap`/`auto`), `adBreaks`, `timeout`, skip policy, request metadata, `resumeContentOnError` |
+| `NativeVideoPlayerAdBreak` | One placement: `preRoll` / `midRoll(position:)` / `postRoll`, with a stable `id` |
+| `NativeVideoPlayerAdvertisementController` | Reached via `controller.advertisementController`: state, streams, `currentBreak`, `skipAdvertisement()` |
+| `NativeVideoPlayerAdEvent` / `NativeVideoPlayerAdEventType` | Normalized ad events and event enum |
+| `NativeVideoPlayerAdMetadata` | Served-ad info (`adId`, `title`, `isSkippable`, `skipTimeOffset`, …) |
+| `NativeVideoPlayerAdError` | Structured ad failure (`code`, `message`, `details`) |
+| `NativeVideoPlayerAdPlaybackState` / `NativeVideoPlayerAdSessionState` | Ad playback state and content/ad phase enums |
+| `NativeVideoPlayerAdSkipConfiguration` | App-level skip gate (`allowUserSkip`, `skipAfter`) |
+| `NativeVideoPlayerAdRequestMetadata` | Content context sent with the ad request |
 
+See [Advertisement Support](#advertisement-support) for examples and the full reference.
+
+### Companion Helpers
 | Class | Purpose |
 |-------|---------|
 | `NativeVideoPlayerPlaylist` | Sequential playback with auto-advance on one controller |
@@ -2076,7 +2515,7 @@ void dispose() {
   _controller.removeControlListener(_handleControlEvent);
   _controller.removeAirPlayAvailabilityListener(_handleAirPlayAvailability);
   _controller.removeAirPlayConnectionListener(_handleAirPlayConnection);
-  
+
   // Choose the appropriate disposal method:
   // - Use dispose() for complete cleanup (recommended in most cases)
   // - Use releaseResources() only for shared player scenarios
@@ -2086,6 +2525,17 @@ void dispose() {
 ```
 
 **Note:** See the [Lifecycle Management](#lifecycle-management) section for details on when to use `dispose()` vs `releaseResources()`.
+
+**Advertisements not playing or behaving unexpectedly:**
+- Ensure `load()` is called **with** an `adConfiguration` — a plain `load()` plays content with advertising disabled.
+- Ensure `initialize()` runs (and is awaited) **before** `load()`.
+- Subscribe to `controller.advertisementController.events` and `.errors` **before** `load()`, otherwise startup events are lost.
+- Verify the VAST/VMAP tag URL is reachable from the device and returns a valid response.
+- Do not mix a manual `adBreaks` schedule with `tagType: vmap` — VMAP owns the schedule.
+- Give every break a **unique, stable `id`**; duplicate ids collapse into a single break.
+- Position-based mid-rolls need a known content duration; they do not apply to live streams.
+- Ads require **platform-view mode**; on Web/WASM, desktop, or texture-mode tiles the native IMA UI is unavailable.
+- See [Getting Ads Working Without Errors](#getting-ads-working-without-errors) and the ad troubleshooting table for a complete symptom/cause/fix list.
 
 ### iOS
 
@@ -2235,6 +2685,7 @@ See the `example` folder for a complete working example demonstrating:
 - **Separated Event Handling**: Activity and control events with detailed logging
 - **Custom Media Info**: Now Playing integration with metadata
 - **Buffered Position Indicator**: Visual representation of how much video has been preloaded
+- **In-Video Ads**: pre-roll / mid-roll / post-roll and VMAP configurations with live ad-event and error logging
 - **Chromecast**: device scan, connect, load with captions, full remote control with live status (`screens/perf/cast_screen.dart`)
 - **Offline Downloads**: progress bar, cancel/remove, offline playback (`screens/perf/download_screen.dart`)
 - **Sidecar Subtitles & Audio Tracks**: external VTT/SRT styling demo and multi-audio HLS selection
