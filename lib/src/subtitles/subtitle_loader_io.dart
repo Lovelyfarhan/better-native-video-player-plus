@@ -16,7 +16,7 @@ class SubtitleLoader {
           uri: Uri.parse(url),
         );
       }
-      return response.transform(utf8.decoder).join();
+      return await response.transform(utf8.decoder).join(); // ← added await
     } finally {
       client.close();
     }
