@@ -19,6 +19,9 @@ void main() {
     expect(configuration.toMap(), <String, Object>{
       'adTagUrl': 'https://ads.example.com/tag',
       'tagType': 'auto',
+      // The per-tag waterfall deadline always travels so the native adapter can
+      // enforce it even when no fallback tag is configured.
+      'perTagTimeoutMs': 8000,
     });
   });
 

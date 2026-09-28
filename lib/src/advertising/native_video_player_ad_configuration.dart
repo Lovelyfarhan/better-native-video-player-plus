@@ -225,6 +225,11 @@ class NativeVideoPlayerAdBreak {
 @immutable
 class NativeVideoPlayerAdConfiguration {
   /// Creates optional advertising configuration for one content load.
+  ///
+  /// [adTagUrl] remains the primary tag and is always the first tag the
+  /// waterfall requests. Pass [vastTags] to configure additional fallback
+  /// tags: they are requested in order whenever the current tag reports no ad
+  /// ("no fill") or times out. See [NativeVideoPlayerAdWaterfallManager].
   const NativeVideoPlayerAdConfiguration({
     required this.adTagUrl,
     this.tagType = NativeVideoPlayerAdTagType.auto,
@@ -234,9 +239,15 @@ class NativeVideoPlayerAdConfiguration {
     this.skipConfiguration,
     this.requestMetadata,
     this.resumeContentOnError = true,
+    this.vastTags = const <Uri>[],
+    this.perTagTimeout = const Duration(seconds: 8),
+    this.includeSingleTagAsFallback = false,
   });
 
   /// Configuration for a VAST tag and an optional client-side break schedule.
+  ///
+  /// Use [vastTags] to provide an ordered waterfall of VAST tags. The first
+  /// entry is requested first; the rest are fallbacks tried in order.
   const NativeVideoPlayerAdConfiguration.vast({
     required Uri adTagUrl,
     bool enabled = true,
@@ -246,6 +257,9 @@ class NativeVideoPlayerAdConfiguration {
     NativeVideoPlayerAdSkipConfiguration? skipConfiguration,
     NativeVideoPlayerAdRequestMetadata? requestMetadata,
     bool resumeContentOnError = true,
+    List<Uri> vastTags = const <Uri>[],
+    Duration perTagTimeout = const Duration(seconds: 8),
+    bool includeSingleTagAsFallback = false,
   }) : this(
          adTagUrl: adTagUrl,
          tagType: NativeVideoPlayerAdTagType.vast,
@@ -255,10 +269,52 @@ class NativeVideoPlayerAdConfiguration {
          skipConfiguration: skipConfiguration,
          requestMetadata: requestMetadata,
          resumeContentOnError: resumeContentOnError,
+         vastTags: vastTags,
+         perTagTimeout: perTagTimeout,
+         includeSingleTagAsFallback: includeSingleTagAsFallback,
        );
+
+  /// Creates a configuration whose tag order is exactly [vastTags].
+  ///
+  /// Convenience for the common "ordered waterfall" case: the first entry is
+  /// also the primary [adTagUrl] sent on the content `load` command. The list
+  /// must not be empty and every entry must be a VAST tag.
+  factory NativeVideoPlayerAdConfiguration.vastWaterfall({
+    required List<Uri> vastTags,
+    bool enabled = true,
+    List<NativeVideoPlayerAdBreak> adBreaks =
+        const <NativeVideoPlayerAdBreak>[],
+    Duration? timeout,
+    NativeVideoPlayerAdSkipConfiguration? skipConfiguration,
+    NativeVideoPlayerAdRequestMetadata? requestMetadata,
+    bool resumeContentOnError = true,
+    Duration perTagTimeout = const Duration(seconds: 8),
+  }) {
+    if (vastTags.isEmpty) {
+      throw ArgumentError.value(
+        vastTags,
+        'vastTags',
+        'A VAST waterfall requires at least one tag URL.',
+      );
+    }
+    return NativeVideoPlayerAdConfiguration.vast(
+      adTagUrl: vastTags.first,
+      enabled: enabled,
+      adBreaks: adBreaks,
+      timeout: timeout,
+      skipConfiguration: skipConfiguration,
+      requestMetadata: requestMetadata,
+      resumeContentOnError: resumeContentOnError,
+      vastTags: vastTags,
+      perTagTimeout: perTagTimeout,
+    );
+  }
 
   /// Configuration for a VMAP tag. VMAP commonly supplies its own schedule,
   /// but [adBreaks] remains available for provider-specific future adapters.
+  ///
+  /// VMAP is schedule-owned by the ad server, so it does not participate in a
+  /// VAST waterfall; [vastTags] is ignored for a VMAP configuration.
   const NativeVideoPlayerAdConfiguration.vmap({
     required Uri adTagUrl,
     bool enabled = true,
@@ -280,7 +336,7 @@ class NativeVideoPlayerAdConfiguration {
        );
 
   /// VAST or VMAP ad-tag URL.
-  /// VAST or VMAP tag URL.
+  /// VAST or VMAP tag URL. Also the first tag requested by the waterfall.
   final Uri adTagUrl;
 
   /// Declared tag format, or [NativeVideoPlayerAdTagType.auto] to detect it
@@ -313,8 +369,62 @@ class NativeVideoPlayerAdConfiguration {
   /// current content state. Defaults to true so an advertising failure does
   /// not block content playback. Set false only when the application needs a
   /// failed ad break to remain visible to its own recovery flow.
+  ///
+  /// This applies once the **entire waterfall** has failed. While tags remain,
+  /// a "no fill" failure advances to the next tag instead of ending the ad
+  /// session, so content stays deferred until the waterfall resolves.
   /// Whether content resumes automatically after an ad failure.
   final bool resumeContentOnError;
+
+  /// Ordered fallback VAST tags requested after [adTagUrl].
+  ///
+  /// The waterfall requests [adTagUrl] first, then each entry here in order,
+  /// until one returns an ad, one starts playing, or the list is exhausted.
+  /// Entries that are empty or duplicate [adTagUrl] are ignored. VMAP
+  /// configurations do not use this list.
+  final List<Uri> vastTags;
+
+  /// Deadline applied to each individual tag request in the waterfall.
+  ///
+  /// If a tag neither loads an ad nor reports an error within this window, the
+  /// waterfall treats it as "no fill" and advances to the next tag. Defaults
+  /// to 8 seconds, which is long enough for a real VAST response and short
+  /// enough that a slow tag does not stall the user. A tag-specific
+  /// [NativeVideoPlayerAdBreak.adTagUrl] override does not reset this value.
+  final Duration perTagTimeout;
+
+  /// Whether the primary [adTagUrl] should also be retried as a fallback when
+  /// [vastTags] is empty.
+  ///
+  /// Defaults to `false`, preserving the historical single-tag behavior of one
+  /// request per break. Set it to `true` when an application wants the same
+  /// tag attempted twice (for example when the server is expected to fill on a
+  /// second request). It is ignored when [vastTags] is non-empty.
+  final bool includeSingleTagAsFallback;
+
+  /// The ordered, de-duplicated tag list the waterfall will request.
+  ///
+  /// Always begins with [adTagUrl]. When [vastTags] is supplied, its non-empty
+  /// entries follow, in order, with duplicates removed. When [vastTags] is
+  /// empty, this is either a single tag or, if [includeSingleTagAsFallback] is
+  /// true, the same tag listed twice.
+  List<Uri> get waterfallTags {
+    final ordered = <Uri>[adTagUrl];
+    for (final tag in vastTags) {
+      if (tag.toString().isNotEmpty && !ordered.contains(tag)) {
+        ordered.add(tag);
+      }
+    }
+    if (vastTags.isEmpty && includeSingleTagAsFallback) {
+      ordered.add(adTagUrl);
+    }
+    return List<Uri>.unmodifiable(ordered);
+  }
+
+  /// Whether this configuration requests more than one tag, i.e. a waterfall
+  /// with an actual fallback. A single-tag configuration returns false so the
+  /// controller can keep its original single-request path.
+  bool get hasTagWaterfall => waterfallTags.length > 1;
 
   /// All configured pre-roll breaks. A configuration usually has zero or one.
   List<NativeVideoPlayerAdBreak> get preRollBreaks =>
@@ -328,6 +438,22 @@ class NativeVideoPlayerAdConfiguration {
   List<NativeVideoPlayerAdBreak> get postRollBreaks =>
       _breaksOfType(NativeVideoPlayerAdBreakType.postRoll);
 
+  /// Adds a [copyWith] with the waterfall-aware tag list.
+  NativeVideoPlayerAdConfiguration copyWith({List<Uri>? vastTags}) =>
+      NativeVideoPlayerAdConfiguration(
+        adTagUrl: adTagUrl,
+        tagType: tagType,
+        enabled: enabled,
+        adBreaks: adBreaks,
+        timeout: timeout,
+        skipConfiguration: skipConfiguration,
+        requestMetadata: requestMetadata,
+        resumeContentOnError: resumeContentOnError,
+        vastTags: vastTags ?? this.vastTags,
+        perTagTimeout: perTagTimeout,
+        includeSingleTagAsFallback: includeSingleTagAsFallback,
+      );
+
   Map<String, Object> toMap() => <String, Object>{
     'adTagUrl': adTagUrl.toString(),
     'tagType': tagType.name,
@@ -339,6 +465,10 @@ class NativeVideoPlayerAdConfiguration {
       'skipConfiguration': skipConfiguration!.toMap(),
     if (requestMetadata != null) 'requestMetadata': requestMetadata!.toMap(),
     if (!resumeContentOnError) 'resumeContentOnError': false,
+    if (vastTags.isNotEmpty)
+      'vastTags': vastTags.map((tag) => tag.toString()).toList(),
+    'perTagTimeoutMs': perTagTimeout.inMilliseconds,
+    if (includeSingleTagAsFallback) 'includeSingleTagAsFallback': true,
   };
 
   List<NativeVideoPlayerAdBreak> _breaksOfType(

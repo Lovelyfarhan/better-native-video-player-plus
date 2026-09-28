@@ -98,6 +98,7 @@ void main() {
         },
         <String, Object>{'id': 'post-roll', 'type': 'postRoll'},
       ],
+      'perTagTimeoutMs': 8000,
     });
     expect(configuration.preRollBreaks.single.id, 'pre-roll');
     expect(
@@ -152,6 +153,9 @@ void main() {
           'contentUrl': 'https://content.example.com/episode-42',
           'customParameters': <String, String>{'category': 'drama'},
         },
+        // VMAP never uses a tag waterfall, but the shared envelope still
+        // carries the per-tag deadline for the native adapter.
+        'perTagTimeoutMs': 8000,
       });
     },
   );

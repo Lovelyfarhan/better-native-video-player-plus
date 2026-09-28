@@ -14,10 +14,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ad pods, normalized ad events, quartile tracking, click-through metadata,
   skip offsets, and skippable/non-skippable ad UI.
 - Recoverable and fatal ad error policies with lifecycle cleanup.
+- **VAST tag waterfall / fallback**: `NativeVideoPlayerAdConfiguration.vast`
+  accepts an ordered `List<Uri> vastTags`, and the new
+  `NativeVideoPlayerAdConfiguration.vastWaterfall` builds a configuration whose
+  tag order is exactly the supplied list. Tags are requested in order until one
+  returns a playable ad.
+- `perTagTimeout` (default 8 s) bounding each tag so a slow or empty ad server
+  cannot stall the break; `includeSingleTagAsFallback` to retry a single tag.
+- New `NativeVideoPlayerAdWaterfallManager` encapsulating the fallback policy,
+  with an immutable per-tag `snapshot`, `currentIndex`/`currentTag`/`totalTags`,
+  and `NativeVideoPlayerAdWaterfallCallbacks` (`onTagRequested`, `onTagFilled`,
+  `onTagFailed`, `onAdStarted`, `onAllTagsFailed`).
+- New ad event types `tagRequested`, `tagFailed`, and `waterfallExhausted`, plus
+  `tagIndex`/`totalTags`/`adTagUrl` on `NativeVideoPlayerAdEvent`.
+- No-fill classification of `VAST_EMPTY_RESPONSE`, `VAST_NO_ADS_AFTER_WRAPPER`,
+  `VAST_MEDIA_LOAD_TIMEOUT`, `AD_BREAK_FETCH_ERROR`, load failures, and
+  message-based no-fill errors.
+- `advertisementController.waterfall`, `hasTagWaterfall`, `currentTagIndex`, and
+  `currentTags` for observing waterfall progress.
+
+### Changed
+- `advertisementController.requestAdvertisements()` is now a public entry point
+  that routes single-tag configurations through the original one-request path
+  and multi-tag configurations through the waterfall. The previous per-tag
+  `initialize` + `request` behavior is preserved unchanged for one tag.
+- `NativeVideoPlayerAdConfiguration.toMap()` now always emits `perTagTimeoutMs`
+  and `vastTags` (when non-empty).
 
 ### Documentation
 - Added advertising setup, API, event, lifecycle, VAST, VMAP, and platform
   configuration examples to the README.
+- Added a **VAST Tag Waterfall (Fallback Tags)** guide covering tag ordering,
+  no-fill detection, per-tag timeout, observer callbacks, bridge behavior, and
+  compatibility with single-tag and VMAP configurations.
 
 ## [1.5.2] - 2026-07-07
 

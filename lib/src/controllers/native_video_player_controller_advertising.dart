@@ -19,6 +19,14 @@ class NativeVideoPlayerAdvertisementController {
   NativeVideoPlayerAdEvent? _lastEvent;
   bool _isDisposed = false;
 
+  /// Drives ordered VAST-tag fallback for the active break, when the
+  /// configuration supplies more than one tag.
+  NativeVideoPlayerAdWaterfallManager? _waterfall;
+  StreamSubscription<NativeVideoPlayerAdEvent>? _waterfallEventSubscription;
+
+  /// The break whose tags are currently being requested through [_waterfall].
+  NativeVideoPlayerAdBreak? _waterfallBreak;
+
   final StreamController<NativeVideoPlayerAdPlaybackState> _stateController =
       StreamController<NativeVideoPlayerAdPlaybackState>.broadcast();
   final StreamController<NativeVideoPlayerAdSessionState>
@@ -74,9 +82,162 @@ class NativeVideoPlayerAdvertisementController {
   /// Emits structured advertisement errors.
   Stream<NativeVideoPlayerAdError> get errors => _errorController.stream;
 
+  /// The active VAST-tag waterfall, or null when the current configuration has
+  /// a single tag (or none).
+  ///
+  /// Applications normally do not need this: the same milestones are emitted
+  /// as [NativeVideoPlayerAdEvent]s on [events]. It is exposed for callers that
+  /// want to render an "attempt N of M" progress indicator.
+  NativeVideoPlayerAdWaterfallManager? get waterfall => _waterfall;
+
+  /// Whether more than one tag is being tried for the current break.
+  bool get hasTagWaterfall => _waterfall?.isRunning ?? false;
+
+  /// Zero-based index of the tag currently being requested, or null when no
+  /// waterfall is active.
+  int? get currentTagIndex => _waterfall?.isRunning == true
+      ? _waterfall!.currentIndex
+      : null;
+
+  /// Ordered tag list of the active waterfall, or an empty list.
+  List<Uri> get currentTags => _waterfall?.snapshot
+          .map((tag) => tag.url)
+          .toList(growable: false) ??
+      const <Uri>[];
+
   /// Requests the active native ad to skip when IMA permits it.
   Future<void> skipAdvertisement() async {
     await _platform?.skipAdvertisement();
+  }
+
+  /// Requests the configured ad schedule for the current content load.
+  ///
+  /// A single-tag configuration issues exactly one request, preserving the
+  /// original behavior. A configuration with more than one tag starts the
+  /// VAST waterfall instead: the first tag is requested, and every "no fill"
+  /// or timeout advances to the next tag until an ad plays or the list is
+  /// exhausted.
+  ///
+  /// [breakInfo] identifies the break being requested (pre-roll, a mid-roll,
+  /// or a post-roll). It is recorded so waterfall events can report which
+  /// break they belong to.
+  ///
+  /// [onRequestIssued] runs once the first tag request has been handed to the
+  /// platform. The post-roll path uses it to signal content completion only
+  /// after a request is in flight.
+  Future<void> requestAdvertisements({
+    NativeVideoPlayerAdBreak? breakInfo,
+    Future<void> Function()? onRequestIssued,
+  }) async {
+    if (_isDisposed) {
+      return;
+    }
+    final configuration = _configuration;
+    final platform = _platform;
+    if (configuration == null || !configuration.enabled || platform == null) {
+      return;
+    }
+
+    if (!configuration.hasTagWaterfall) {
+      // Single-tag path: unchanged from the original implementation.
+      await platform.initializeAdvertisement(configuration);
+      await platform.requestAdvertisements();
+      await onRequestIssued?.call();
+      return;
+    }
+
+    _waterfallBreak = breakInfo;
+    final waterfall = _ensureWaterfall();
+    if (!waterfall.start(configuration)) {
+      return;
+    }
+    // The waterfall's requestTag callback performs initialize + request for
+    // each tag, so the first request is already in flight here.
+    await onRequestIssued?.call();
+  }
+
+  /// Builds (or rebuilds) the waterfall and its event bridge.
+  NativeVideoPlayerAdWaterfallManager _ensureWaterfall() {
+    _waterfallEventSubscription?.cancel();
+    _waterfall = NativeVideoPlayerAdWaterfallManager(
+      requestTag: (tagConfiguration) async {
+        final platform = _platform;
+        if (platform == null) {
+          return;
+        }
+        // Re-initializing with the next tag destroys the previous AdsManager
+        // inside the native bridge while the AdsLoader is created once per
+        // content load and reused for every fallback.
+        await platform.initializeAdvertisement(tagConfiguration);
+        await platform.requestAdvertisements();
+      },
+      onTagAbandoned: () async {
+        // Best-effort teardown of the failed attempt. A failure here must not
+        // stop the waterfall, so it is swallowed by the manager.
+        await _platform?.stopAdvertisement();
+      },
+      continueOnFatalErrors: true,
+    );
+    _waterfallEventSubscription = _waterfall!.events.listen(
+      _handleWaterfallEvent,
+    );
+    return _waterfall!;
+  }
+
+  /// Forwards a waterfall milestone onto the public ad event stream.
+  ///
+  /// The event is enriched with the break it belongs to and the content
+  /// context, then applied to the ad state machine so `tagRequested`
+  /// advances to `requesting` and `waterfallExhausted` fails the session.
+  void _handleWaterfallEvent(NativeVideoPlayerAdEvent event) {
+    if (_isDisposed || _eventController.isClosed) {
+      return;
+    }
+    final requestMetadata = _configuration?.requestMetadata;
+    final enriched = event.copyWithContext(
+      timestamp: event.timestamp ?? DateTime.now(),
+      contentId: event.contentId ?? requestMetadata?.contentId,
+      contentTitle: event.contentTitle ?? requestMetadata?.contentTitle,
+      contentUrl: event.contentUrl ?? requestMetadata?.contentUrl,
+    );
+
+    // Publish to the ad streams first so an application observes the same
+    // order an adapter would produce: event, then any state change.
+    if (!_eventController.isClosed) {
+      _lastEvent = enriched;
+      _eventController.add(enriched);
+    }
+    if (event.error != null && !_errorController.isClosed) {
+      _lastError = event.error;
+      _errorController.add(event.error!);
+    }
+
+    if (_waterfallBreak != null) {
+      _currentBreak = _waterfallBreak;
+    }
+    _applyEventTransition(enriched);
+  }
+
+  /// Reports a per-tag error to the waterfall, if one is active.
+  ///
+  /// Returns true when the waterfall consumed the error and advanced (or
+  /// ended) on its own, so the caller must not also treat it as a terminal
+  /// ad-session failure.
+  bool _reportToWaterfall(NativeVideoPlayerAdError error) {
+    final waterfall = _waterfall;
+    if (waterfall == null || !waterfall.isRunning) {
+      return false;
+    }
+    // A failure reported before an ad started is a tag-level failure. After
+    // playback begins a media error is also per-tag (the creative itself
+    // failed), which [onPlaybackError] models.
+    waterfall.onPlaybackError(error);
+    return true;
+  }
+
+  /// Releases the current AdsManager while keeping the AdsLoader reusable.
+  Future<void> abandonCurrentTag() async {
+    await _platform?.stopAdvertisement();
   }
 
   /// Associates the current per-view transport with this controller.
@@ -106,6 +267,7 @@ class NativeVideoPlayerAdvertisementController {
     if (_isDisposed) {
       return;
     }
+    _cancelWaterfall();
     _configuration = configuration;
     _contentActivityState = contentActivityState;
     _currentBreak = null;
@@ -196,6 +358,7 @@ class NativeVideoPlayerAdvertisementController {
 
   bool _applyEventTransition(NativeVideoPlayerAdEvent event) {
     switch (event.type) {
+      case NativeVideoPlayerAdEventType.tagRequested:
       case NativeVideoPlayerAdEventType.requestStarted:
       case NativeVideoPlayerAdEventType.breakReady:
         if (!_isContentPhase(_sessionState) &&
@@ -237,6 +400,9 @@ class NativeVideoPlayerAdvertisementController {
         if (!canStart) {
           return false;
         }
+        // The waterfall is resolved the moment an ad actually starts: a later
+        // failure is a normal ad-session failure, not a fallback trigger.
+        _waterfall?.onAdStarted();
         _setSessionState(NativeVideoPlayerAdSessionState.adPlaying);
         _setState(NativeVideoPlayerAdPlaybackState.playing);
         return true;
@@ -275,32 +441,31 @@ class NativeVideoPlayerAdvertisementController {
             _sessionState != NativeVideoPlayerAdSessionState.adSkipped) {
           return false;
         }
+        _cancelWaterfall();
         _currentBreak = null;
         _setState(NativeVideoPlayerAdPlaybackState.idle);
         _setSessionState(_contentSessionStateFor(_contentActivityState));
         return true;
 
+      case NativeVideoPlayerAdEventType.tagFailed:
+        // A per-tag failure is consumed by the waterfall; it must not fail the
+        // ad session while tags remain, otherwise a "no fill" on tag 1 would
+        // stop the fallback to tag 2.
+        return false;
+
+      case NativeVideoPlayerAdEventType.waterfallExhausted:
+        // Every tag failed. Now the ad session genuinely fails, and the usual
+        // resumeContentOnError policy decides whether content continues.
+        return _applyAdSessionFailure();
+
       case NativeVideoPlayerAdEventType.error:
-        final canRecoverFromContent = switch (_sessionState) {
-          NativeVideoPlayerAdSessionState.contentInitialized ||
-          NativeVideoPlayerAdSessionState.contentLoading ||
-          NativeVideoPlayerAdSessionState.contentLoaded => true,
-          _ => false,
-        };
-        if (!canRecoverFromContent &&
-            _sessionState != NativeVideoPlayerAdSessionState.adLoading &&
-            _sessionState != NativeVideoPlayerAdSessionState.adPlaying &&
-            _sessionState != NativeVideoPlayerAdSessionState.adPaused) {
+        // Errors that belong to a single tag are routed to the waterfall,
+        // which advances to the next tag or ends the waterfall. Only an error
+        // outside a waterfall run fails the ad session directly.
+        if (event.error != null && _reportToWaterfall(event.error!)) {
           return false;
         }
-        _setSessionState(NativeVideoPlayerAdSessionState.adFailed);
-        _setState(NativeVideoPlayerAdPlaybackState.error);
-        if (_configuration!.resumeContentOnError) {
-          _currentBreak = null;
-          _setState(NativeVideoPlayerAdPlaybackState.idle);
-          _setSessionState(_contentSessionStateFor(_contentActivityState));
-        }
-        return true;
+        return _applyAdSessionFailure();
 
       case NativeVideoPlayerAdEventType.adProgress:
       case NativeVideoPlayerAdEventType.firstQuartile:
@@ -313,6 +478,33 @@ class NativeVideoPlayerAdvertisementController {
       case NativeVideoPlayerAdEventType.unknown:
         return false;
     }
+  }
+
+  /// Fails the whole ad session, honoring [NativeVideoPlayerAdConfiguration
+  /// .resumeContentOnError]. Used once a waterfall is exhausted and for
+  /// single-tag errors.
+  bool _applyAdSessionFailure() {
+    final canRecoverFromContent = switch (_sessionState) {
+      NativeVideoPlayerAdSessionState.contentInitialized ||
+      NativeVideoPlayerAdSessionState.contentLoading ||
+      NativeVideoPlayerAdSessionState.contentLoaded => true,
+      _ => false,
+    };
+    if (!canRecoverFromContent &&
+        _sessionState != NativeVideoPlayerAdSessionState.adLoading &&
+        _sessionState != NativeVideoPlayerAdSessionState.adPlaying &&
+        _sessionState != NativeVideoPlayerAdSessionState.adPaused) {
+      return false;
+    }
+    _cancelWaterfall();
+    _setSessionState(NativeVideoPlayerAdSessionState.adFailed);
+    _setState(NativeVideoPlayerAdPlaybackState.error);
+    if (_configuration?.resumeContentOnError ?? true) {
+      _currentBreak = null;
+      _setState(NativeVideoPlayerAdPlaybackState.idle);
+      _setSessionState(_contentSessionStateFor(_contentActivityState));
+    }
+    return true;
   }
 
   bool _isAdPhase(NativeVideoPlayerAdSessionState state) => switch (state) {
@@ -371,11 +563,28 @@ class NativeVideoPlayerAdvertisementController {
     }
   }
 
+  /// Stops any in-flight waterfall without emitting a terminal event.
+  void _cancelWaterfall() {
+    _waterfall?.cancel();
+    _waterfallBreak = null;
+  }
+
+  /// Tears down the waterfall and its event bridge.
+  Future<void> _disposeWaterfall() async {
+    await _waterfallEventSubscription?.cancel();
+    _waterfallEventSubscription = null;
+    final waterfall = _waterfall;
+    _waterfall = null;
+    _waterfallBreak = null;
+    await waterfall?.dispose();
+  }
+
   Future<void> dispose() async {
     if (_isDisposed) {
       return;
     }
     _isDisposed = true;
+    await _disposeWaterfall();
     _configuration = null;
     _detachPlatform();
     _currentBreak = null;
@@ -434,8 +643,9 @@ extension _NativeVideoPlayerMidRollScheduling on NativeVideoPlayerController {
     _midRollRequestInFlight = true;
 
     try {
-      await _methodChannel!.initializeAdvertisement(configuration);
-      await _methodChannel!.requestAdvertisements();
+      await advertisementController.requestAdvertisements(
+        breakInfo: dueBreak,
+      );
     } catch (_) {
       _midRollRequestInFlight = false;
       _activeMidRollBreak = null;
@@ -503,9 +713,14 @@ extension _NativeVideoPlayerMidRollScheduling on NativeVideoPlayerController {
     _postRollTriggered = true;
     _postRollRequestInFlight = true;
     try {
-      await _methodChannel!.initializeAdvertisement(configuration);
-      await _methodChannel!.requestAdvertisements();
-      await _methodChannel!.completeContentForAdvertisement();
+      await advertisementController.requestAdvertisements(
+        breakInfo: configuration.postRollBreaks.isEmpty
+            ? null
+            : configuration.postRollBreaks.first,
+        onRequestIssued: () async {
+          await _methodChannel!.completeContentForAdvertisement();
+        },
+      );
     } finally {
       _postRollRequestInFlight = false;
     }

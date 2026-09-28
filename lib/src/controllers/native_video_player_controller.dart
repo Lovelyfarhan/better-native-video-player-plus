@@ -10,6 +10,7 @@ import '../config/native_video_player_config.dart';
 import '../advertising/native_video_player_ad_configuration.dart';
 import '../advertising/native_video_player_ad_event.dart';
 import '../advertising/native_video_player_ad_platform.dart';
+import '../advertising/native_video_player_ad_waterfall.dart';
 import '../enums/native_video_player_event.dart';
 import '../fullscreen/fullscreen_manager.dart';
 import '../fullscreen/fullscreen_video_player.dart';
@@ -1615,8 +1616,14 @@ class NativeVideoPlayerController {
       );
 
       if (preRollConfiguration != null && (hasPreRoll || hasVmapAds)) {
-        await _methodChannel!.initializeAdvertisement(preRollConfiguration);
-        await _methodChannel!.requestAdvertisements();
+        // Routes through the advertisement controller so a multi-tag VAST
+        // configuration starts its waterfall; a single tag keeps the original
+        // one-request behavior.
+        await advertisementController.requestAdvertisements(
+          breakInfo: preRollConfiguration.preRollBreaks.isEmpty
+              ? null
+              : preRollConfiguration.preRollBreaks.first,
+        );
       }
 
       // Re-apply the embedded caption text scale to the fresh player item.

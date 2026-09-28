@@ -68,6 +68,22 @@ enum NativeVideoPlayerAdEventType {
   /// The native adapter began requesting ads.
   requestStarted,
 
+  /// A specific tag in a multi-tag waterfall is about to be requested.
+  ///
+  /// This is emitted for every tag, including the first, so an application can
+  /// show "trying ad source N of M". The event's `metadata.adSystem`/
+  /// `rawType` payload carries the zero-based tag index and the total tag
+  /// count through [NativeVideoPlayerAdEvent.tagIndex] and
+  /// [NativeVideoPlayerAdEvent.totalTags].
+  tagRequested,
+
+  /// The current tag failed to fill and the waterfall advanced to the next
+  /// tag.
+  tagFailed,
+
+  /// Every tag in the waterfall has been exhausted without a playable ad.
+  waterfallExhausted,
+
   /// An ad/break was loaded and is ready.
   breakReady,
 
@@ -209,6 +225,9 @@ class NativeVideoPlayerAdEvent {
     this.contentId,
     this.contentTitle,
     this.contentUrl,
+    this.tagIndex,
+    this.totalTags,
+    this.adTagUrl,
   });
 
   /// Normalized event type.
@@ -255,6 +274,16 @@ class NativeVideoPlayerAdEvent {
   /// Application content URL.
   final Uri? contentUrl;
 
+  /// Zero-based index of the waterfall tag this event belongs to, when the
+  /// event was produced by a multi-tag request. Null for single-tag flows.
+  final int? tagIndex;
+
+  /// Total number of tags in the active waterfall, when applicable.
+  final int? totalTags;
+
+  /// The tag URL the event belongs to, when applicable.
+  final Uri? adTagUrl;
+
   NativeVideoPlayerAdEvent copyWithContext({
     DateTime? timestamp,
     String? contentId,
@@ -275,6 +304,9 @@ class NativeVideoPlayerAdEvent {
     contentId: contentId ?? this.contentId,
     contentTitle: contentTitle ?? this.contentTitle,
     contentUrl: contentUrl ?? this.contentUrl,
+    tagIndex: tagIndex,
+    totalTags: totalTags,
+    adTagUrl: adTagUrl,
   );
 
   factory NativeVideoPlayerAdEvent.fromMap(Map<dynamic, dynamic> map) {
@@ -307,6 +339,11 @@ class NativeVideoPlayerAdEvent {
       contentUrl: (map['contentUrl'] as String?) == null
           ? null
           : Uri.tryParse(map['contentUrl'] as String),
+      tagIndex: (map['tagIndex'] as num?)?.toInt(),
+      totalTags: (map['totalTags'] as num?)?.toInt(),
+      adTagUrl: (map['adTagUrl'] as String?) == null
+          ? null
+          : Uri.tryParse(map['adTagUrl'] as String),
     );
   }
 
@@ -325,6 +362,9 @@ class NativeVideoPlayerAdEvent {
   static NativeVideoPlayerAdEventType _eventTypeFromWire(String value) {
     return switch (value) {
       'requestStarted' => NativeVideoPlayerAdEventType.requestStarted,
+      'tagRequested' => NativeVideoPlayerAdEventType.tagRequested,
+      'tagFailed' => NativeVideoPlayerAdEventType.tagFailed,
+      'waterfallExhausted' => NativeVideoPlayerAdEventType.waterfallExhausted,
       'breakReady' => NativeVideoPlayerAdEventType.breakReady,
       'breakStarted' => NativeVideoPlayerAdEventType.breakStarted,
       'adStarted' => NativeVideoPlayerAdEventType.adStarted,

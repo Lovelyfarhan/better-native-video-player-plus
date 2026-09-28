@@ -15,6 +15,7 @@ export 'src/config/native_video_player_config.dart';
 export 'src/advertising/native_video_player_ad_configuration.dart';
 export 'src/advertising/native_video_player_ad_event.dart';
 export 'src/advertising/native_video_player_ad_overlay.dart';
+export 'src/advertising/native_video_player_ad_waterfall.dart';
 export 'src/controllers/native_video_player_controller.dart';
 export 'src/enums/native_video_player_event.dart';
 export 'src/fullscreen/fullscreen_manager.dart';

@@ -11,10 +11,19 @@ official **Google IMA** SDK. You can play **pre-roll, mid-roll, post-roll**, and
 pods, and automatic content resume — all without changing the existing content
 player API.
 
+It also supports an **ordered VAST-tag waterfall**: give it several tags and the
+player automatically falls back to the next one whenever a tag returns no ad
+(“no fill”, empty VAST, or a timeout), so a single empty ad server never leaves a
+break without an ad.
+
 - ✅ **Pre-roll / mid-roll / post-roll / multiple mid-rolls** via a typed `adBreaks` schedule
 - ✅ **VAST** and **VMAP** tags, with the schedule owned by IMA for VMAP
+- ✅ **VAST tag waterfall / fallback** — pass an ordered `List<Uri> vastTags`; empty or
+  slow tags are skipped automatically, with a configurable per-tag timeout
 - ✅ **Google IMA** on both platforms: native Media3 IMA on Android, official IMA CocoaPod on iOS
 - ✅ **Normalized ad events** (request, ready, started, quartiles, pause/resume, skip, click, complete, break, all-ads-completed, error)
+- ✅ **Waterfall events** (`tagRequested`, `tagFailed`, `waterfallExhausted`) so the app
+  knows which tag is being tried, when a fallback happens, and when every tag failed
 - ✅ **Ad pods** (`adPositionInPod` / `totalAdsInPod`) and **skip** behavior (`isSkippable`, `skipTimeOffset`)
 - ✅ **Error-safe by default** — a failed ad resumes content and releases native ad resources
 - ✅ **Optional** — a controller without `adConfiguration` behaves exactly like an ordinary content player
@@ -34,6 +43,24 @@ await controller.loadUrl(
   url: 'https://example.com/video.mp4',
   adConfiguration: NativeVideoPlayerAdConfiguration.vast(
     adTagUrl: Uri.parse('https://ads.example.com/pre-roll-vast.xml'),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+    ],
+  ),
+);
+```
+
+```dart
+// VAST waterfall — try tags in order until one fills.
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+    vastTags: <Uri>[
+      Uri.parse('https://ads.example.com/primary.xml'),
+      Uri.parse('https://backup.example.com/secondary.xml'),
+      Uri.parse('https://fallback.example.com/tertiary.xml'),
+    ],
+    perTagTimeout: const Duration(seconds: 6),
     adBreaks: const <NativeVideoPlayerAdBreak>[
       NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
     ],
@@ -71,8 +98,7 @@ final sub = controller.advertisementController.events.listen((event) {
 - ✅ **Picture-in-Picture (PiP)** mode on both platforms with automatic state management
 - ✅ **AirPlay** support on iOS with availability detection and connection events
 - ✅ Native **fullscreen** playback with Dart-side fullscreen option
-- ✅ **In-Video Ads (IN-Ads)** 🆕: pre-roll, mid-roll, post-roll and VMAP schedules via Google IMA (VAST/VMAP) with normalized events, ad pods, skip handling, and error-safe content resume — [see full guide](#advertisement-support)
-- ✅ **Custom overlay controls** - Build your own UI on top of native player
+- ✅ **In-Video Ads (IN-Ads)** 🆕: pre-roll, mid-roll, post-roll and VMAP schedules via Google IMA (VAST/VMAP) with normalized events, ad pods, skip handling, and error-safe content resume — [see full guide](#advertisement-support)- ✅ **Custom overlay controls** - Build your own UI on top of native player
 - ✅ **Now Playing** integration (Control Center on iOS, lock screen notifications on Android)
 - ✅ Background playback with media notifications
 - ✅ Playback controls: play, pause, seek, volume, speed (0.25x - 2.0x)
@@ -295,6 +321,429 @@ await controller.loadUrl(
 A VAST response typically describes **one break**. To place ads at several
 positions, add one `adBreaks` entry (or use VMAP instead — see below).
 
+### VAST Tag Waterfall (Fallback Tags)
+
+> 📖 **Full reference:** the complete guide — every parameter, the ordering and
+> error rules, timeout budgeting, the observer API, cookbook recipes, and
+> troubleshooting — lives in
+> [`doc/advertising_waterfall.md`](doc/advertising_waterfall.md).
+
+A single ad tag can legitimately return **no ad** — the server had nothing to
+fill, the response was empty, or the network timed out. A waterfall removes that
+single point of failure: you supply an ordered list of tags, and the player
+requests them one by one until one returns an ad.
+
+The flow for a pre-roll, for example, is exactly:
+
+```text
+request tag 1 → ad plays?              → done
+             → no fill / timeout       → request tag 2
+request tag 2 → ad plays?              → done
+             → no fill / timeout       → request tag 3
+request tag 3 → ...                    → until all tags fail
+```
+
+If every tag fails, the break ends like any other failed ad: by default the
+content resumes (`resumeContentOnError: true`).
+
+#### Quick start — copy this
+
+```dart
+final controller = NativeVideoPlayerController(id: 1, autoPlay: true);
+await controller.initialize();
+
+// Subscribe *before* load() so you do not miss the first tagRequested.
+controller.advertisementController.events.listen((event) {
+  switch (event.type) {
+    case NativeVideoPlayerAdEventType.tagRequested:
+      print('trying tag ${event.tagIndex! + 1}/${event.totalTags}: ${event.adTagUrl}');
+    case NativeVideoPlayerAdEventType.tagFailed:
+      print('tag ${event.tagIndex} failed: ${event.error?.code} → falling back');
+    case NativeVideoPlayerAdEventType.waterfallExhausted:
+      print('every ad tag failed — content continues');
+    case NativeVideoPlayerAdEventType.adStarted:
+      print('ad playing from tag ${event.tagIndex}');
+    default:
+      break;
+  }
+});
+
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+    vastTags: <Uri>[
+      Uri.parse('https://ads.example.com/primary.xml'),
+      Uri.parse('https://backup.example.com/secondary.xml'),
+      Uri.parse('https://fallback.example.com/tertiary.xml'),
+    ],
+    // Keep each ad server on a short leash (default is 8s).
+    perTagTimeout: const Duration(seconds: 6),
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+    ],
+  ),
+);
+```
+
+There are two equivalent ways to declare the tag list — pick either:
+
+#### Option A — `vastWaterfall` (recommended)
+
+The tag order is exactly the list you pass; the first entry is also the primary
+`adTagUrl` used for the initial request. Throws `ArgumentError` on an empty
+list, so a missing tag list fails fast at the call site instead of silently
+playing no ads.
+
+```dart
+await controller.loadUrl(
+  url: 'https://example.com/video.mp4',
+  adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+    vastTags: <Uri>[
+      Uri.parse('https://ads.example.com/primary.xml'),   // tag 1
+      Uri.parse('https://backup.example.com/secondary.xml'), // tag 2
+      Uri.parse('https://fallback.example.com/tertiary.xml'), // tag 3
+    ],
+    perTagTimeout: const Duration(seconds: 6), // default is 8s
+    adBreaks: const <NativeVideoPlayerAdBreak>[
+      NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+    ],
+  ),
+);
+```
+
+#### Option B — `vast` with `vastTags`
+
+Keeps an explicit primary tag and appends fallbacks after it. `adTagUrl` is
+**always first**, and duplicate or empty entries are ignored — so the effective
+order is deterministic even if the same URL appears twice.
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+  adTagUrl: Uri.parse('https://ads.example.com/primary.xml'), // requested first
+  vastTags: <Uri>[                                           // then these, in order
+    Uri.parse('https://backup.example.com/secondary.xml'),
+    Uri.parse('https://fallback.example.com/tertiary.xml'),
+  ],
+  perTagTimeout: const Duration(seconds: 6),
+  adBreaks: const <NativeVideoPlayerAdBreak>[
+    NativeVideoPlayerAdBreak.preRoll(id: 'intro-ad'),
+  ],
+)
+```
+
+#### Configuration reference
+
+Every new parameter, with its default:
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `vastTags` | `List<Uri>` | `const <Uri>[]` | Ordered fallback tags requested after `adTagUrl`. Ignored when `vastWaterfall` already supplied the full list, and for VMAP. |
+| `perTagTimeout` | `Duration` | `Duration(seconds: 8)` | Deadline for **each** tag. On expiry the tag counts as no fill and the waterfall advances. `Duration.zero` disables the timer. |
+| `includeSingleTagAsFallback` | `bool` | `false` | When `vastTags` is empty, retry the single `adTagUrl` once. Ignored when `vastTags` is non-empty. |
+
+Two read-only getters are then available on the configuration (useful for logging
+and for asserting your intended order in tests):
+
+| Getter | Returns |
+|--------|---------|
+| `waterfallTags` | The effective ordered, de-duplicated `List<Uri>`, always starting with `adTagUrl`. |
+| `hasTagWaterfall` | `true` when more than one tag will be requested (i.e. a real fallback exists). |
+
+The wire payload sent to the native adapter also carries these fields:
+`vastTags` (as string URLs, omitted when empty), `perTagTimeoutMs` (always
+present), and `includeSingleTagAsFallback` (omitted when `false`).
+
+#### Ordering rules in detail
+
+The effective order is deterministic and follows these rules:
+
+1. `adTagUrl` is **always** the first tag, whichever constructor you use.
+2. Entries in `vastTags` follow, in the exact order you listed them.
+3. Empty tag strings are skipped.
+4. Duplicates are removed; the first occurrence wins. Passing `adTagUrl` again
+   inside `vastTags` therefore does **not** create a retry — use
+   `includeSingleTagAsFallback` for that.
+5. When `vastTags` is empty and `includeSingleTagAsFallback` is true, the single
+   tag is listed twice.
+
+```dart
+// Effective order → [primary, backup]   (the duplicate `primary` is dropped)
+NativeVideoPlayerAdConfiguration.vast(
+  adTagUrl: Uri.parse('https://ads.example.com/primary.xml'),
+  vastTags: <Uri>[
+    Uri.parse('https://ads.example.com/primary.xml'), // ignored, already first
+    Uri.parse('https://backup.example.com/secondary.xml'),
+  ],
+)
+```
+
+#### When the waterfall advances
+
+A tag is abandoned and the next one is requested when it produces **no
+playable ad**. The package treats these as “no fill”:
+
+| Provider code | Meaning |
+|---------------|---------|
+| `VAST_EMPTY_RESPONSE` | The VAST document contains no `<Ad>` |
+| `VAST_NO_ADS_AFTER_WRAPPER` | A wrapper resolved to nothing |
+| `VAST_MEDIA_LOAD_TIMEOUT` | The selected media never became playable |
+| `AD_BREAK_FETCH_ERROR` | IMA could not fetch the break |
+| `IMA_AD_LOAD_ERROR`, `LOAD_ERROR` | The ad server could not be reached |
+| `IMA_AD_ERROR`, `IMA_OPERATION_FAILED`, `AD_PLAYER_ERROR` | Treated as no fill when the message says no ad/empty VAST (see below) |
+| `AD_TAG_TIMEOUT` | **The package's own per-tag timeout fired** |
+| `AD_TAG_REQUEST_FAILED` | The tag request itself failed to be issued |
+
+Any error whose message mentions “no ad”, “no fill”, “empty VAST”, “no ads”,
+“does not contain any ads”, or “no valid ad” is also treated as no fill, even if
+the provider used a different code. This message check is what keeps the
+waterfall working across IMA SDK versions that rename or reclassify errors.
+
+Errors that clearly mean the request itself was malformed (for example a VAST
+schema validation error) end the waterfall rather than pointlessly retrying the
+remaining tags. You can inspect this rule yourself:
+
+```dart
+final isNoFill = NativeVideoPlayerAdWaterfallManager.isNoFillError(
+  const NativeVideoPlayerAdError(
+    code: 'VAST_SCHEMA_VALIDATION_ERROR',
+    message: 'The VAST document did not validate.',
+  ),
+);
+print(isNoFill); // false — this is a fatal error, not no fill
+```
+
+A creative that fails **after** it was selected (for example the ad video URL
+404s) also falls through to the next tag, because that tag still could not
+deliver a playable ad.
+
+There is one deliberate exception to “advance on every failure”: once an ad has
+**actually started playing**, the waterfall is finished. A failure after that
+point is a normal ad-session failure and does **not** restart the fallback chain.
+
+#### Per-tag timeout
+
+`perTagTimeout` (default **8 seconds**) bounds each individual tag. If a tag
+neither loads an ad nor reports an error within that window, it is treated as no
+fill and the waterfall moves on. This is what stops a slow or empty ad server
+from holding the user on a black screen. Set it to a shorter value (5–6s) if
+your tags are known to respond quickly, or `Duration.zero` to disable the timer
+and rely only on the provider's own callbacks.
+
+The timeout applies **per tag, not per break**, so a three-tag waterfall with a
+6s timeout can take up to about 18s in the worst case (every server hanging).
+Keep the budget in mind:
+
+| Tags | `perTagTimeout` | Worst-case wait before content starts |
+|------|-----------------|---------------------------------------|
+| 2 | 6s | ~12s |
+| 3 | 6s | ~18s |
+| 3 | 4s | ~12s |
+
+A tag that fails *immediately* (no fill on a fast response) does not wait out
+the timeout — the next tag is requested as soon as the error arrives, which is
+the common case.
+
+#### Observing the waterfall
+
+**Streams (recommended).** The waterfall milestones arrive on the existing ad
+event stream, so you need no extra subscription machinery:
+
+| Event | Meaning |
+|-------|---------|
+| `tagRequested` | A tag is about to be requested. Carries `tagIndex` (zero-based) and `totalTags`. |
+| `tagFailed` | The current tag returned no ad and was abandoned. `error` holds the reason; `tagIndex`/`adTagUrl` identify the tag. |
+| `waterfallExhausted` | Every tag failed; the break ends. `metadata.adSystem` carries the stop reason (`allTagsExhausted` or `fatalError`). |
+
+**Live manager state.** Read the manager the controller already owns to build an
+“attempt N of M” indicator:
+
+```dart
+final ads = controller.advertisementController;
+
+ads.waterfall          // the NativeVideoPlayerAdWaterfallManager, or null
+ads.hasTagWaterfall    // true only while a multi-tag run is in progress
+ads.currentTagIndex    // 0-based index being requested, or null
+ads.currentTags        // ordered List<Uri> of the active run
+ads.waterfall?.snapshot // per-tag state: pending/requesting/filled/noFill/failed
+```
+
+`snapshot` is an immutable `List<NativeVideoPlayerAdWaterfallTag>`; each entry
+exposes `url`, `index`, `state`, `error`, and `isRequesting`:
+
+```dart
+for (final tag in ads.waterfall?.snapshot ?? const []) {
+  print('${tag.index}: ${tag.url} → ${tag.state.name}');
+}
+```
+
+`NativeVideoPlayerAdWaterfallTagState` is one of `pending`, `requesting`,
+`filled`, `noFill`, or `failed`.
+
+#### Observer callbacks (advanced)
+
+If you drive the manager yourself — or want callbacks instead of streams — pass a
+`NativeVideoPlayerAdWaterfallCallbacks` when constructing
+`NativeVideoPlayerAdWaterfallManager`:
+
+| Callback | Fires when |
+|----------|------------|
+| `onTagRequested(tag, index, total)` | A tag is about to be requested (index is zero-based) |
+| `onTagFilled(tag, index)` | A tag returned an ad (before playback starts) |
+| `onTagFailed(tag, index, error, nextIndex)` | A tag was abandoned; `nextIndex` is null when none remain |
+| `onAdStarted(tag, index)` | The resolved tag's ad actually started playing |
+| `onAllTagsFailed(reason)` | Every tag was exhausted; `reason` is a `NativeVideoPlayerAdWaterfallStopReason` |
+
+```dart
+final waterfall = NativeVideoPlayerAdWaterfallManager(
+  requestTag: (config) async => myAdapter.request(config.adTagUrl),
+  onTagAbandoned: () async => myAdapter.destroyCurrentAdsManager(),
+  continueOnFatalErrors: false, // stop on schema errors (default)
+  callbacks: NativeVideoPlayerAdWaterfallCallbacks(
+    onTagRequested: (tag, index, total) =>
+        print('trying ${index + 1}/$total: $tag'),
+    onTagFailed: (tag, index, error, next) =>
+        print('$tag failed (${error.code}); next=${next ?? 'none'}'),
+    onAdStarted: (tag, index) => print('ad playing from $tag'),
+    onAllTagsFailed: (reason) => print('waterfall ended: ${reason.name}'),
+  ),
+);
+
+waterfall.start(configuration);
+// ... later, when the ad session ends:
+await waterfall.dispose();
+```
+
+The manager lifecycle methods, if you drive it directly:
+
+| Method | Purpose |
+|--------|---------|
+| `start(configuration)` | Begin the run. Returns `false` when there is no tag or the manager is disposed. Cancels any previous run first. |
+| `onTagLoaded()` | The current tag returned an ad (playback not necessarily started). |
+| `onAdStarted()` | An ad actually started playing; resolves the waterfall. |
+| `onTagNoFill(error)` | The current tag produced no ad; advance if tags remain. |
+| `onTagFailed(error)` | A provider error; advances only for no-fill codes unless `continueOnFatalErrors` is set. |
+| `onPlaybackError(error)` | A media error after `ready`; still advances to the next tag. |
+| `cancel({reason})` | Stop the run without a terminal event; a late native event is ignored. |
+| `dispose()` | Release the manager and its stream. Safe to call more than once. |
+
+#### How the waterfall crosses the native bridge
+
+You do not lose IMA's single-`AdsLoader` design:
+
+- The **`AdsLoader` is created once per content load and reused** for every tag.
+- Before requesting the next tag, the previous **`AdsManager` is destroyed**, so
+  only one manager is ever alive.
+- `adTagUrl` is the only value that changes between requests; the `adBreaks`
+  schedule, skip policy, metadata, and `resumeContentOnError` stay identical.
+- Waterfall logic lives entirely in Dart
+  ([`NativeVideoPlayerAdWaterfallManager`](lib/src/advertising/native_video_player_ad_waterfall.dart)),
+  so it is provider-neutral and unit-tested without a device.
+
+#### Compatibility notes
+
+- **Single-tag configurations are unchanged.** With one tag (and
+  `includeSingleTagAsFallback: false`, the default) the controller issues exactly
+  one request, byte-for-byte identical to the previous behavior.
+- **VMAP does not use the waterfall.** VMAP schedules come from the ad server,
+  so `vastTags` is ignored for a VMAP configuration.
+- **Mid-rolls and post-rolls support the waterfall too.** Each break starts its
+  own waterfall with the same ordered tag list, and each break applies its own
+  `perTagTimeout`.
+- Set `includeSingleTagAsFallback: true` to retry even the primary tag once when
+  `vastTags` is empty (useful when the server is expected to fill on a second
+  request).
+- A break-level `NativeVideoPlayerAdBreak.adTagUrl` override is not part of the
+  waterfall; the ordered tag list on the configuration is authoritative.
+- Reloading content (or `load(..., force: true)`) starts a fresh waterfall; any
+  in-flight run is cancelled first.
+
+📖 See [`doc/advertising_waterfall.md`](doc/advertising_waterfall.md) for the
+complete API reference, cookbook, and troubleshooting table.
+
+#### Cookbook
+
+**Pre-roll with three ad networks**
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+  vastTags: <Uri>[networkA, networkB, networkC],
+  perTagTimeout: const Duration(seconds: 5),
+  adBreaks: const <NativeVideoPlayerAdBreak>[
+    NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+  ],
+)
+```
+
+**Mid-roll fallback at 10 and 20 minutes** — the same tag list is used for every
+break, and each break runs its own waterfall:
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+  vastTags: <Uri>[networkA, networkB],
+  adBreaks: const <NativeVideoPlayerAdBreak>[
+    NativeVideoPlayerAdBreak.midRoll(
+      id: 'break-10m',
+      position: Duration(minutes: 10),
+    ),
+    NativeVideoPlayerAdBreak.midRoll(
+      id: 'break-20m',
+      position: Duration(minutes: 20),
+    ),
+  ],
+)
+```
+
+**Retry the same tag once** (no second URL available):
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vast(
+  adTagUrl: Uri.parse('https://ads.example.com/tag.xml'),
+  includeSingleTagAsFallback: true,
+  adBreaks: const <NativeVideoPlayerAdBreak>[
+    NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+  ],
+)
+```
+
+**Never let ads delay content indefinitely** — a very tight budget:
+
+```dart
+adConfiguration: NativeVideoPlayerAdConfiguration.vastWaterfall(
+  vastTags: <Uri>[networkA, networkB, networkC],
+  perTagTimeout: const Duration(seconds: 3), // 3 × 3s ≈ 9s worst case
+  adBreaks: const <NativeVideoPlayerAdBreak>[
+    NativeVideoPlayerAdBreak.preRoll(id: 'pre'),
+  ],
+)
+```
+
+**Show which source is filling** in your own UI:
+
+```dart
+StreamBuilder<NativeVideoPlayerAdEvent>(
+  stream: controller.advertisementController.events,
+  builder: (context, snap) {
+    final event = snap.data;
+    if (event?.type != NativeVideoPlayerAdEventType.tagRequested) {
+      return const SizedBox.shrink();
+    }
+    final attempted = (event!.tagIndex ?? 0) + 1;
+    return Text('Ad source $attempted of ${event.totalTags}');
+  },
+)
+```
+
+#### Troubleshooting the waterfall
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Only the first tag is ever requested | `vastTags` empty, or the list collapsed to one entry by de-duplication | Print `configuration.waterfallTags` and confirm it has more than one entry |
+| Fallback happens immediately on every request | The primary tag returns a plain no-fill code, which is the intended behavior | Nothing to fix — this is the waterfall working |
+| A schema error stops the chain | Fatal errors end the waterfall by default | Fix the malformed tag, or drive the manager with `continueOnFatalErrors: true` |
+| Content takes too long to start | `perTagTimeout` × number of tags is the worst case | Lower `perTagTimeout`, or use fewer tags |
+| `waterfall` is null | The run already resolved, or the configuration has one tag | Check `hasTagWaterfall`; single-tag runs keep the original path |
+| No waterfall events at all | Subscribed after `load()` | Subscribe to `events` before calling `load()` |
+
 ### VMAP
 ```dart
 await controller.loadUrl(
@@ -314,6 +763,7 @@ multiple-break schedule. Manual `adBreaks` are ignored when `tagType` is VMAP.
 | Place a break at a position **you** choose in Dart | `...vast(...)` + `adBreaks` | Your `adBreaks` list |
 | Let the ad server define the whole schedule | `...vmap(...)` | The VMAP response (IMA) |
 | Single simple pre-roll | `...vast(...)` + one `preRoll` | Your `adBreaks` list |
+| Fall back to another ad server when a tag is empty | `...vastWaterfall(vastTags: [...])` | Your `adBreaks` list |
 
 If you are unsure, start with **VAST + a pre-roll**: it is the smallest moving
 part and exercises the same native path as the other placements.
@@ -331,6 +781,64 @@ final subscription = controller.advertisementController.events.listen((event) {
 
 Events include request, loaded, started, quartile, paused, resumed, skipped,
 clicked, completed, ad-break, all-ads-completed, and error notifications.
+
+### Waterfall Events
+
+When a configuration has more than one tag, three additional event types tell
+you exactly where the waterfall is:
+
+| Event | Fields | Meaning |
+|-------|--------|---------|
+| `tagRequested` | `tagIndex`, `totalTags`, `adTagUrl` | A tag is about to be requested. |
+| `tagFailed` | `tagIndex`, `totalTags`, `adTagUrl`, `error` | The current tag returned no ad and was abandoned. |
+| `waterfallExhausted` | `tagIndex`, `error`, `metadata.adSystem` | Every tag failed; the break ends. `metadata.adSystem` carries the stop reason (`allTagsExhausted` or `fatalError`). |
+
+```dart
+controller.advertisementController.events.listen((event) {
+  switch (event.type) {
+    case NativeVideoPlayerAdEventType.tagRequested:
+      print('trying tag ${event.tagIndex! + 1}/${event.totalTags}: ${event.adTagUrl}');
+    case NativeVideoPlayerAdEventType.tagFailed:
+      print('tag ${event.tagIndex} failed: ${event.error?.code} → falling back');
+    case NativeVideoPlayerAdEventType.waterfallExhausted:
+      print('all ad tags failed — content continues');
+    case NativeVideoPlayerAdEventType.adStarted:
+      print('ad playing from tag ${event.tagIndex}');
+    default:
+      break;
+  }
+});
+```
+
+The stop reason on `waterfallExhausted` is one of
+`NativeVideoPlayerAdWaterfallStopReason.allTagsExhausted`,
+`.fatalError`, or `.cancelled` (the latter is not emitted as an event — it is
+reported only through `onAllTagsFailed` when a run is cancelled).
+
+### Observing Waterfall Progress
+
+`controller.advertisementController.waterfall` exposes the live manager for an
+“attempt N of M” indicator:
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `waterfall` | `NativeVideoPlayerAdWaterfallManager?` | The active manager, or null when idle |
+| `hasTagWaterfall` | `bool` | True only while a multi-tag run is in progress |
+| `currentTagIndex` | `int?` | 0-based index being requested, or null |
+| `currentTags` | `List<Uri>` | Ordered tags of the active run |
+| `waterfall?.isRunning` | `bool` | A run is in progress |
+| `waterfall?.currentTag` | `Uri?` | The tag being requested |
+| `waterfall?.totalTags` | `int` | Tags in the active run |
+| `waterfall?.snapshot` | `List<NativeVideoPlayerAdWaterfallTag>` | Per-tag `url`, `index`, `state`, `error`, `isRequesting` |
+
+```dart
+for (final tag in controller.advertisementController.waterfall?.snapshot ?? const []) {
+  print('${tag.index}: ${tag.url} → ${tag.state.name}'); // pending/requesting/filled/noFill/failed
+}
+```
+
+📖 The [waterfall guide](doc/advertising_waterfall.md) covers the full API,
+timeout budgeting, the callback interface, and a troubleshooting table.
 
 ### Error Handling
 
@@ -571,7 +1079,21 @@ Prefer **VMAP** or **pre/post-roll** for live content.
 #### 5. Do not combine VMAP with a manual schedule
 When `tagType` is VMAP, the VMAP response is authoritative and manual `adBreaks`
 are ignored. Pass either a manual schedule (VAST) **or** VMAP — not both, and not
-with the expectation that the manual list still applies.
+with the expectation that the manual list still applies. A VMAP configuration
+also ignores `vastTags`: the waterfall is a VAST feature only.
+
+#### 5b. Give the waterfall the right tag order and timeout
+
+- The first tag in `vastTags` is always requested first; later entries are
+  fallbacks in the order given. Reordering the list reorders the waterfall.
+- Duplicate URLs are ignored, so the effective order is stable.
+- `perTagTimeout` (default 8s) should be shorter than the time a user will
+  tolerate before content appears. 5–6s is a good choice for responsive ad
+  servers; `Duration.zero` disables the Dart-side timer.
+- A tag that fails with a **schema** error is not retried against the remaining
+  tags — that is deliberate, because the problem is the response, not the
+  network. If you disagree, drive the manager yourself with
+  `continueOnFatalErrors: true`.
 
 #### 6. Keep `adConfiguration` off unsupported surfaces
 Native IMA ad UI is only available on **Android API 24+** and **iOS 12+** in
